@@ -1,0 +1,15 @@
+# Future top-level project outputs
+/target/
+/build/
+/dist/
+/.cache/
+/.codex/
+
+/.history/
+
+# Legacy generated and editor data; retained locally but never part of the new project
+/legacy/
+
+# Machine-local sibling implementation reference
+/rm-servo
+/rm-display-android

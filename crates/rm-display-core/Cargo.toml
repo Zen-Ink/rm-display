@@ -1,0 +1,10 @@
+[package]
+name = "rm-display-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rm-display-protocol = { path = "../rm-display-protocol" }
+thiserror = "1.0"

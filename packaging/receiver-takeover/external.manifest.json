@@ -1,0 +1,31 @@
+{
+  "id": "rm-display-receiver",
+  "name": "rm-display Receiver",
+  "version": "0.1.0",
+  "description": "Quill takeover receiver for the rm-display protocol",
+  "application": "scripts/takeover.sh",
+  "args": [],
+  "environment": {},
+  "qtfb": false,
+  "aspectRatio": "auto",
+  "disablesWindowedMode": true,
+  "architecture": "aarch64",
+  "license": "GPL-2.0-only",
+  "bundledLibraries": [
+    "libquill.so",
+    "libqsgepaper.so"
+  ],
+  "requiredLibraries": [
+    "libssl.so.3",
+    "libcrypto.so.3",
+    "libdrm.so.2",
+    "libQt6Quick.so.6",
+    "libQt6Gui.so.6",
+    "libQt6Qml.so.6",
+    "libQt6Core.so.6",
+    "libstdc++.so.6",
+    "libm.so.6",
+    "libgcc_s.so.1",
+    "libc.so.6"
+  ]
+}

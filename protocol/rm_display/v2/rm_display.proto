@@ -1,0 +1,581 @@
+syntax = "proto3";
+
+package rm_display.v2;
+
+option java_package = "com.rm.display.protocol.v2";
+option java_multiple_files = true;
+option java_outer_classname = "RmDisplayV2";
+
+// Field numbers are permanent. Removed fields must be reserved and never reused.
+
+enum ProtocolFeature {
+  PROTOCOL_FEATURE_UNSPECIFIED = 0;
+  PROTOCOL_FEATURE_ATOMIC_MULTI_REGION = 1;
+  PROTOCOL_FEATURE_EXACT_BASE_DELTA = 2;
+  PROTOCOL_FEATURE_LATEST_SUPERSEDE = 3;
+  PROTOCOL_FEATURE_SETTLED_BARRIER = 4;
+  PROTOCOL_FEATURE_POINTER_INPUT = 5;
+  PROTOCOL_FEATURE_KEY_INPUT = 6;
+  PROTOCOL_FEATURE_TEXT_INPUT = 7;
+  PROTOCOL_FEATURE_ACTIONS = 8;
+  // Negotiated, session-scoped receiver refresh-policy query/set control.
+  PROTOCOL_FEATURE_EPAPER_PROFILE_CONTROL = 9;
+  // Negotiated, session-scoped receiver refresh parameters and cleanup action.
+  PROTOCOL_FEATURE_EPAPER_REFRESH_CONTROL = 10;
+  // Protocol v2.1: surfaces may use little-endian packed RGB565 pixels.
+  PROTOCOL_FEATURE_COLOR_RGB565 = 11;
+  // Protocol v2.1: frame flow control also accounts for decoded bytes in flight.
+  PROTOCOL_FEATURE_BYTE_CREDITS = 12;
+  // Protocol v2.2: atomic custom e-paper waveform/refresh-policy control.
+  PROTOCOL_FEATURE_EPAPER_CUSTOM_PROFILE = 13;
+}
+
+enum ProducerKind {
+  PRODUCER_KIND_UNSPECIFIED = 0;
+  PRODUCER_KIND_ANDROID_COMPANION = 1;
+  PRODUCER_KIND_ANDROID_MIRROR = 2;
+  PRODUCER_KIND_BROWSER = 3;
+  PRODUCER_KIND_LINUX_CLI = 4;
+  PRODUCER_KIND_DOCUMENT = 5;
+}
+
+enum PixelFormat {
+  PIXEL_FORMAT_UNSPECIFIED = 0;
+  PIXEL_FORMAT_GRAY8 = 1;
+  PIXEL_FORMAT_GRAY4 = 2; // Reserved for a later negotiated minor version.
+  // Two bytes per pixel, little-endian: rrrrrggg gggbbbbb.
+  PIXEL_FORMAT_RGB565_LE = 3;
+}
+
+enum Encoding {
+  ENCODING_UNSPECIFIED = 0;
+  ENCODING_RAW = 1;
+  ENCODING_ZLIB = 2;
+  // Standard Zstandard frame without a shared dictionary.
+  ENCODING_ZSTD = 3;
+}
+
+enum Orientation {
+  ORIENTATION_UNSPECIFIED = 0;
+  ORIENTATION_CURRENT = 1;
+  ORIENTATION_PORTRAIT = 2;
+  ORIENTATION_LANDSCAPE = 3;
+}
+
+enum SourceKind {
+  // Advisory producer metadata only. It must not select receiver display policy.
+  // UNSPECIFIED is valid when a source does not fit an existing diagnostic label.
+  SOURCE_KIND_UNSPECIFIED = 0;
+  SOURCE_KIND_SCREEN_MIRROR = 1;
+  SOURCE_KIND_BROWSER = 2;
+  SOURCE_KIND_LINUX_STREAM = 3;
+  SOURCE_KIND_DOCUMENT = 4;
+  SOURCE_KIND_TEST_PATTERN = 5;
+}
+
+enum InputCapability {
+  // Per-surface input accepted by the producer and emitted by the receiver.
+  // UNSPECIFIED is never advertised as a capability.
+  INPUT_CAPABILITY_UNSPECIFIED = 0;
+  INPUT_CAPABILITY_TOUCH = 1;
+  INPUT_CAPABILITY_PEN = 2;
+  INPUT_CAPABILITY_MOUSE = 3;
+  INPUT_CAPABILITY_KEY = 4;  // Physical key transitions identified by USB HID usage.
+  INPUT_CAPABILITY_TEXT = 5; // Unicode IME commit/composition/cancel operations.
+}
+
+enum FrameIntent {
+  FRAME_INTENT_UNSPECIFIED = 0;
+  FRAME_INTENT_LATEST = 1;
+  FRAME_INTENT_SETTLED = 2;
+}
+
+enum ContentClass {
+  CONTENT_CLASS_UNSPECIFIED = 0;
+  CONTENT_CLASS_TEXT_UI = 1;
+  CONTENT_CLASS_PHOTO = 2;
+  CONTENT_CLASS_VIDEO = 3;
+  CONTENT_CLASS_MIXED = 4;
+}
+
+enum FrameResultCode {
+  FRAME_RESULT_CODE_UNSPECIFIED = 0;
+  FRAME_RESULT_CODE_PRESENTED = 1;
+  FRAME_RESULT_CODE_SUPERSEDED = 2;
+  FRAME_RESULT_CODE_NEED_KEYFRAME = 3;
+  FRAME_RESULT_CODE_REJECTED = 4;
+}
+
+enum FrameResultReason {
+  FRAME_RESULT_REASON_NONE = 0;
+  FRAME_RESULT_REASON_WRONG_SURFACE = 1;
+  FRAME_RESULT_REASON_BAD_BASE = 2;
+  FRAME_RESULT_REASON_BAD_REGION = 3;
+  FRAME_RESULT_REASON_BAD_LENGTH = 4;
+  FRAME_RESULT_REASON_BAD_CRC = 5;
+  FRAME_RESULT_REASON_UNSUPPORTED = 6;
+  FRAME_RESULT_REASON_NO_CREDIT = 7;
+  FRAME_RESULT_REASON_BACKEND_FAILURE = 8;
+  FRAME_RESULT_REASON_PROTOCOL_STATE = 9;
+}
+
+// Diagnostic reason for a receiver-selected complete panel refresh. This does
+// not grant producers control over native waveform selection.
+enum FullRefreshReason {
+  FULL_REFRESH_REASON_NONE = 0;
+  FULL_REFRESH_REASON_PARTIAL_DISABLED = 1;
+  FULL_REFRESH_REASON_FORCED = 2;
+  FULL_REFRESH_REASON_FIRST_FRAME = 3;
+  FULL_REFRESH_REASON_PERIODIC = 4;
+  FULL_REFRESH_REASON_LARGE_DAMAGE = 5;
+  FULL_REFRESH_REASON_STATIC_FAST_DEBT = 6;
+}
+
+enum PointerDevice {
+  POINTER_DEVICE_UNSPECIFIED = 0;
+  POINTER_DEVICE_TOUCH = 1;
+  POINTER_DEVICE_PEN = 2;
+  POINTER_DEVICE_MOUSE = 3;
+}
+
+enum PointerPhase {
+  POINTER_PHASE_UNSPECIFIED = 0;
+  POINTER_PHASE_DOWN = 1;
+  POINTER_PHASE_MOVE = 2;
+  POINTER_PHASE_UP = 3;
+  POINTER_PHASE_CANCEL = 4;
+  POINTER_PHASE_HOVER = 5;
+}
+
+enum KeyPhase {
+  KEY_PHASE_UNSPECIFIED = 0;
+  KEY_PHASE_DOWN = 1;
+  KEY_PHASE_UP = 2;
+  KEY_PHASE_REPEAT = 3;
+}
+
+enum TextOperation {
+  TEXT_OPERATION_UNSPECIFIED = 0;
+  TEXT_OPERATION_COMMIT = 1;
+  TEXT_OPERATION_COMPOSITION = 2;
+  TEXT_OPERATION_CANCEL = 3;
+}
+
+enum ActionId {
+  ACTION_ID_UNSPECIFIED = 0;
+  ACTION_ID_BACK = 1;
+  ACTION_ID_FORWARD = 2;
+  ACTION_ID_RELOAD = 3;
+  ACTION_ID_HOME = 4;
+  ACTION_ID_MENU = 5;
+  ACTION_ID_PREVIOUS_PAGE = 6;
+  ACTION_ID_NEXT_PAGE = 7;
+}
+
+enum ActionStatus {
+  ACTION_STATUS_UNSPECIFIED = 0;
+  ACTION_STATUS_OK = 1;
+  ACTION_STATUS_UNSUPPORTED = 2;
+  ACTION_STATUS_FAILED = 3;
+}
+
+// These are receiver policy presets, not Quill/native waveform values.
+enum EpaperProfile {
+  EPAPER_PROFILE_UNSPECIFIED = 0;
+  EPAPER_PROFILE_ANIMATE = 1;
+  EPAPER_PROFILE_BALANCED = 2;
+  EPAPER_PROFILE_QUALITY = 3;
+  // Appended for wire compatibility; numeric order is not quality order.
+  EPAPER_PROFILE_REALTIME = 4;
+  EPAPER_PROFILE_READING = 5;
+  // An exact, connection-scoped policy supplied in EpaperProfileRequest.custom.
+  EPAPER_PROFILE_CUSTOM = 6;
+}
+
+// Stable protocol policy values. Receivers map these to their panel backend;
+// the numeric values are deliberately independent of native/Quill constants.
+enum EpaperWaveform {
+  EPAPER_WAVEFORM_UNSPECIFIED = 0;
+  EPAPER_WAVEFORM_FASTEST = 1;
+  EPAPER_WAVEFORM_FAST = 2;
+  EPAPER_WAVEFORM_QUALITY = 3;
+  // Value 4 is intentionally unavailable: full refresh remains a receiver
+  // policy decision rather than a producer-selected waveform.
+  reserved 4;
+}
+
+enum EpaperProfileOperation {
+  EPAPER_PROFILE_OPERATION_UNSPECIFIED = 0;
+  EPAPER_PROFILE_OPERATION_QUERY = 1;
+  EPAPER_PROFILE_OPERATION_SET = 2;
+}
+
+enum EpaperProfileResultCode {
+  EPAPER_PROFILE_RESULT_CODE_UNSPECIFIED = 0;
+  EPAPER_PROFILE_RESULT_CODE_APPLIED = 1;
+  EPAPER_PROFILE_RESULT_CODE_UNCHANGED = 2;
+  EPAPER_PROFILE_RESULT_CODE_REJECTED = 3;
+  EPAPER_PROFILE_RESULT_CODE_UNSUPPORTED = 4;
+}
+
+enum EpaperRefreshOperation {
+  EPAPER_REFRESH_OPERATION_UNSPECIFIED = 0;
+  EPAPER_REFRESH_OPERATION_QUERY = 1;
+  EPAPER_REFRESH_OPERATION_UPDATE = 2;
+  EPAPER_REFRESH_OPERATION_CLEANUP = 3;
+}
+
+enum EpaperRefreshResultCode {
+  EPAPER_REFRESH_RESULT_CODE_UNSPECIFIED = 0;
+  EPAPER_REFRESH_RESULT_CODE_APPLIED = 1;
+  EPAPER_REFRESH_RESULT_CODE_UNCHANGED = 2;
+  EPAPER_REFRESH_RESULT_CODE_REJECTED = 3;
+  EPAPER_REFRESH_RESULT_CODE_UNSUPPORTED = 4;
+  EPAPER_REFRESH_RESULT_CODE_FAILED = 5;
+}
+
+message Envelope {
+  fixed64 session_id = 1;
+  uint32 message_id = 2;
+  reserved 3 to 9;
+
+  oneof body {
+    ClientHello client_hello = 10;
+    ServerHello server_hello = 11;
+    Ping ping = 12;
+    Pong pong = 13;
+    ProtocolError error = 14;
+    Goodbye goodbye = 15;
+
+    SurfaceOpen surface_open = 20;
+    SurfaceReady surface_ready = 21;
+    SurfaceClose surface_close = 22;
+
+    Frame frame = 30;
+    FrameResult frame_result = 31;
+
+    InputBatch input_batch = 40;
+    KeyInput key_input = 41;
+    TextInput text_input = 42;
+    ActionInvoke action_invoke = 43;
+    ActionResult action_result = 44;
+
+    EpaperProfileRequest epaper_profile_request = 45;
+    EpaperProfileResult epaper_profile_result = 46;
+    EpaperRefreshRequest epaper_refresh_request = 47;
+    EpaperRefreshResult epaper_refresh_result = 48;
+  }
+
+  reserved 16 to 19;
+  reserved 23 to 29;
+  reserved 32 to 39;
+  reserved 49 to 99;
+}
+
+message ClientHello {
+  uint32 min_minor = 1;
+  uint32 max_minor = 2;
+  ProducerKind producer_kind = 3;
+  repeated ProtocolFeature features = 4;
+  repeated PixelFormat pixel_formats = 5;
+  repeated Encoding encodings = 6;
+  bytes client_id = 7;     // Exactly 16 bytes.
+  bytes token = 8;         // Exactly 32 zero bytes; reserved in protocol v2.
+  bytes client_nonce = 9;  // Exactly 16 fresh random bytes.
+  string name = 10;
+  reserved 11 to 31;
+}
+
+message DisplayInfo {
+  uint32 width = 1;
+  uint32 height = 2;
+  Orientation orientation = 3;
+  repeated PixelFormat pixel_formats = 4;
+  repeated Encoding encodings = 5;
+  repeated InputCapability input_capabilities = 6;
+  reserved 7 to 31;
+}
+
+message Limits {
+  uint32 max_payload = 1;
+  uint32 max_frame_bytes = 2;
+  uint32 max_regions = 3;
+  uint32 max_inflight = 4;
+  uint32 max_fps_x100 = 5;
+  uint32 settled_deadline_ms = 6;
+  // Protocol v2.1. Maximum sum of FrameRegion.decoded_len values accepted
+  // concurrently. Zero means unavailable and is only valid for protocol v2.0.
+  uint64 max_inflight_bytes = 7;
+  reserved 8 to 31;
+}
+
+message ServerHello {
+  uint32 selected_minor = 1;
+  repeated ProtocolFeature features = 2;
+  bytes server_id = 3; // Exactly 16 bytes.
+  DisplayInfo display = 4;
+  Limits limits = 5;
+  string name = 6;
+  reserved 7 to 31;
+}
+
+message Ping { fixed64 cookie = 1; }
+message Pong { fixed64 cookie = 1; }
+
+message ProtocolError {
+  uint32 code = 1;
+  bool fatal = 2;
+  uint32 related_message_id = 3;
+  string message = 4;
+  reserved 5 to 31;
+}
+
+message Goodbye {
+  uint32 reason = 1;
+  string message = 2;
+  reserved 3 to 31;
+}
+
+message SurfaceOpen {
+  uint32 surface_id = 1;
+  uint32 desired_width = 2;  // Zero requests native display geometry.
+  uint32 desired_height = 3;
+  PixelFormat pixel_format = 4;
+  Orientation orientation = 5;
+  SourceKind source_kind = 6;
+  repeated InputCapability input_capabilities = 7;
+  repeated ActionId action_capabilities = 8;
+  string label = 9;
+  reserved 10 to 31;
+}
+
+message SurfaceReady {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  PixelFormat pixel_format = 5;
+  Orientation orientation = 6;
+  SourceKind source_kind = 7;
+  repeated InputCapability input_capabilities = 8;
+  repeated ActionId action_capabilities = 9;
+  Limits limits = 10;
+  reserved 11 to 31;
+}
+
+message SurfaceClose {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  uint32 reason = 3;
+  reserved 4 to 31;
+}
+
+message Rect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+}
+
+message FrameRegion {
+  Rect rect = 1;
+  Encoding encoding = 2;
+  uint32 decoded_len = 3;
+  fixed32 decoded_crc32 = 4;
+  bytes data = 5;
+  reserved 6 to 31;
+}
+
+message Frame {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 frame_id = 3;
+  fixed64 base_frame_id = 4; // Zero denotes a keyframe.
+  FrameIntent intent = 5;
+  ContentClass content_class = 6;
+  repeated FrameRegion regions = 7;
+  fixed64 source_timestamp_us = 8;
+  reserved 9 to 31;
+}
+
+message FrameMetrics {
+  uint32 decode_us = 1;  // Validate, decompress, CRC and apply to the logical base.
+  uint32 queue_us = 2;   // Accepted until presentation work starts, including FPS limiting.
+  uint32 present_us = 3; // Compose through synchronous PanelBackend::submit return.
+  reserved 4 to 15;
+  uint32 compose_us = 16;      // Overlay composition, damage and refresh decision.
+  uint32 convert_us = 17;      // Negotiated pixel conversion/copy into the native framebuffer.
+  uint32 submit_us = 18;       // Backend refresh submission and event pump.
+  uint32 damage_pixels = 19;   // Sum of submitted damage-region areas.
+  uint32 damage_regions = 20;
+  uint32 waveform = 21;        // Receiver-native waveform value used for this frame.
+  bool complete_refresh = 22;
+  FullRefreshReason full_refresh_reason = 23;
+}
+
+message FrameResult {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 frame_id = 3;
+  FrameResultCode result = 4;
+  FrameResultReason reason = 5;
+  uint32 credits = 6;
+  fixed64 logical_frame_id = 7;
+  fixed64 presented_frame_id = 8;
+  FrameMetrics metrics = 9;
+  // Protocol v2.1. Absolute remaining decoded-byte credit after this result.
+  uint64 byte_credits = 10;
+  reserved 11 to 31;
+}
+
+message PointerRecord {
+  PointerDevice device = 1;
+  PointerPhase phase = 2;
+  uint32 flags = 3;
+  uint32 contact_id = 4;
+  fixed32 x_16_16 = 5;
+  fixed32 y_16_16 = 6;
+  uint32 pressure = 7; // 0..65535.
+  uint32 buttons = 8;
+  sint32 tilt_x = 9;
+  sint32 tilt_y = 10;
+  reserved 11 to 31;
+}
+
+message InputBatch {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 sequence = 3;
+  fixed64 monotonic_us = 4;
+  repeated PointerRecord records = 5;
+  reserved 6 to 31;
+}
+
+message KeyInput {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 sequence = 3;
+  fixed64 monotonic_us = 4;
+  KeyPhase phase = 5;
+  uint32 modifiers = 6;
+  uint32 usage_page = 7;
+  uint32 usage = 8;
+  reserved 9 to 31;
+}
+
+message TextInput {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 sequence = 3;
+  fixed64 monotonic_us = 4;
+  TextOperation operation = 5;
+  string text = 6;
+  reserved 7 to 31;
+}
+
+message ActionInvoke {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  uint32 invocation_id = 3;
+  ActionId action = 4;
+  bytes argument = 5;
+  reserved 6 to 31;
+}
+
+message ActionResult {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  uint32 invocation_id = 3;
+  ActionStatus status = 4;
+  string message = 5;
+  reserved 6 to 31;
+}
+
+message EpaperProfileRequest {
+  // Producer-selected, nonzero and strictly increasing within the session.
+  uint32 request_id = 1;
+  EpaperProfileOperation operation = 2;
+  // Required for SET and must be UNSPECIFIED for QUERY.
+  EpaperProfile requested_profile = 3;
+  // Required exactly when requested_profile is CUSTOM. A custom SET is atomic:
+  // every waveform and refresh-policy field below becomes effective together.
+  EpaperProfileConfiguration custom = 4;
+  reserved 5 to 31;
+}
+
+message EpaperProfileConfiguration {
+  EpaperWaveform latest_text_waveform = 1;
+  EpaperWaveform latest_photo_waveform = 2;
+  EpaperWaveform latest_video_waveform = 3;
+  EpaperWaveform settled_waveform = 4;
+  bool partial_refresh_enabled = 5;
+  uint32 cleanup_after_updates = 6;
+  bool clean_first_frame = 7;
+  uint32 large_update_threshold_percent = 8;
+  uint32 static_cleanup_after_fast_updates = 9;
+  uint32 damage_tile = 10;
+  reserved 11 to 31;
+}
+
+message EpaperProfileState {
+  EpaperProfile profile = 1;
+  uint32 cleanup_after_updates = 2;
+  uint32 large_update_threshold_percent = 3;
+  uint32 damage_tile = 4;
+  bool clean_first_frame = 5;
+  uint32 static_cleanup_after_fast_updates = 6;
+  // Complete effective policy for presets as well as CUSTOM. The older scalar
+  // fields above remain populated for backward-compatible clients.
+  EpaperProfileConfiguration effective = 7;
+  reserved 8 to 31;
+}
+
+message EpaperProfileResult {
+  uint32 request_id = 1;
+  EpaperProfileOperation operation = 2;
+  EpaperProfile requested_profile = 3;
+  EpaperProfileResultCode result = 4;
+  EpaperProfileState active = 5;
+  // True only after a successful full-panel submission for this request.
+  bool cleanup_performed = 6;
+  // True when the receiver will force cleanup on the next valid presentation.
+  bool cleanup_pending = 7;
+  string message = 8;
+  reserved 9 to 31;
+}
+
+message EpaperRefreshRequest {
+  // Producer-selected, nonzero and strictly increasing for this request type.
+  uint32 request_id = 1;
+  EpaperRefreshOperation operation = 2;
+  // UPDATE requires at least one present field. QUERY and CLEANUP require none.
+  optional bool partial_refresh_enabled = 3;
+  // Count successful partial panel submissions; zero disables periodic cleanup.
+  optional uint32 cleanup_after_updates = 4;
+  // Bounding-damage panel percentage; zero disables, otherwise 1..100.
+  optional uint32 large_update_threshold_percent = 5;
+  // Wait for SETTLED, then clean once after this many fast panel updates. Zero disables.
+  optional uint32 static_cleanup_after_fast_updates = 6;
+  reserved 7 to 31;
+}
+
+message EpaperRefreshState {
+  bool partial_refresh_enabled = 1;
+  uint32 cleanup_after_updates = 2;
+  uint32 large_update_threshold_percent = 3;
+  uint32 presented_since_full_refresh = 4;
+  bool cleanup_pending = 5;
+  uint32 static_cleanup_after_fast_updates = 6;
+  uint32 fast_updates_since_settled = 7;
+  reserved 8 to 31;
+}
+
+message EpaperRefreshResult {
+  uint32 request_id = 1;
+  EpaperRefreshOperation operation = 2;
+  EpaperRefreshResultCode result = 3;
+  EpaperRefreshState active = 4;
+  bool cleanup_performed = 5;
+  string message = 6;
+  reserved 7 to 31;
+}

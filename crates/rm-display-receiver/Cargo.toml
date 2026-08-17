@@ -1,0 +1,24 @@
+[package]
+name = "rm-display-receiver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-2.0-only"
+build = "build.rs"
+
+[features]
+default = []
+quill = []
+
+[dependencies]
+bytes = "1.6"
+prost = "0.12.6"
+qrcode = { version = "0.14.1", default-features = false }
+rand = "0.8"
+rm-display-core = { path = "../rm-display-core" }
+rm-display-protocol = { path = "../rm-display-protocol" }
+rm-display-transport = { path = "../rm-display-transport" }
+thiserror = "1.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

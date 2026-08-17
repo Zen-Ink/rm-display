@@ -1,0 +1,15 @@
+[package]
+name = "rm-display-transport"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MPL-2.0"
+
+[dependencies]
+foreign-types = "0.3"
+hex = "0.4"
+openssl = "0.10.81"
+openssl-sys = "0.9.117"
+rand = "0.8"
+thiserror = "1.0"
+zeroize = "1.8"
