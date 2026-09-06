@@ -5,12 +5,16 @@ edition = "2021"
 rust-version = "1.85"
 license = "MPL-2.0"
 
+[features]
+default = ["pixels"]
+pixels = ["dep:image"]
+
 [dependencies]
 anyhow = "1.0"
 bytes = "1.6"
 clap = { version = "4.5", features = ["derive"] }
 hex = "0.4"
-image = { version = "=0.25.5", default-features = false, features = ["jpeg", "png"] }
+image = { version = "=0.25.5", default-features = false, features = ["jpeg", "png"], optional = true }
 prost = "0.12.6"
 rand = "0.8"
 rm-display-protocol = { path = "../rm-display-protocol" }

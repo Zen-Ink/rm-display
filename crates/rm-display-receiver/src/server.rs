@@ -111,16 +111,22 @@ fn poll_idle_sources(
 }
 
 impl ReceiverServer {
-    pub fn bind(
+    pub fn bind(config: ReceiverConfig, panel: Box<dyn PanelBackend>) -> Result<Self, ServerError> {
+        let listener = TcpListener::bind(config.listen)?;
+        Self::from_listener(config, panel, listener)
+    }
+
+    /// Builds a receiver around a listener owned by an embedding application.
+    pub fn from_listener(
         mut config: ReceiverConfig,
         panel: Box<dyn PanelBackend>,
+        listener: TcpListener,
     ) -> Result<Self, ServerError> {
         config.validate()?;
         let psk = match &config.security {
             SecurityMode::Plaintext => None,
             SecurityMode::Psk(psk) => Some(PskServerConfig::new(psk.clone())?),
         };
-        let listener = TcpListener::bind(config.listen)?;
         let panel_info = panel.info();
         let pairing_frame = GraySurface::new(panel_info.width, panel_info.height, 255)?;
         #[cfg(target_os = "linux")]
@@ -295,6 +301,11 @@ impl ReceiverServer {
 
     pub fn run_one(&mut self) -> Result<(), ServerError> {
         let (stream, _) = self.listener.accept()?;
+        self.serve_connected(stream)
+    }
+
+    /// Serves a stream already accepted by an embedding application.
+    pub fn serve_connected(&mut self, stream: TcpStream) -> Result<(), ServerError> {
         match self.serve_stream(stream) {
             Err(ServerError::ReceiverExit) => Ok(()),
             Err(ServerError::NewPair) => self.new_pairing(),
