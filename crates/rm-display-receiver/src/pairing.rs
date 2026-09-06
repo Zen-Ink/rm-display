@@ -48,6 +48,7 @@ pub fn pairing_uri(config: &ReceiverConfig, bound: SocketAddr) -> String {
     uri.push_str(&bound.port().to_string());
     match &config.security {
         SecurityMode::Plaintext => uri.push_str("&security=plain"),
+        #[cfg(feature = "tls")]
         SecurityMode::Psk(psk) => {
             uri.push_str("&security=psk&psk=");
             uri.push_str(&psk.pairing_hex());

@@ -11,10 +11,13 @@ use rm_display_core::{
 };
 use rm_display_protocol::wire::{WireCodec, WireError};
 use rm_display_protocol::Rect;
+#[cfg(feature = "tls")]
 use rm_display_transport::{Psk, PskServerConfig};
 use thiserror::Error;
 
-use crate::config::{ConfigError, ReceiverConfig, SecurityMode};
+#[cfg(feature = "tls")]
+use crate::config::SecurityMode;
+use crate::config::{ConfigError, ReceiverConfig};
 #[cfg(all(
     target_os = "linux",
     feature = "quill",
@@ -31,6 +34,7 @@ use crate::session::{Session, SessionError};
 pub struct ReceiverServer {
     config: ReceiverConfig,
     listener: TcpListener,
+    #[cfg(feature = "tls")]
     psk: Option<PskServerConfig>,
     managed_psk_path: Option<PathBuf>,
     panel: Box<dyn PanelBackend>,
@@ -123,6 +127,7 @@ impl ReceiverServer {
         listener: TcpListener,
     ) -> Result<Self, ServerError> {
         config.validate()?;
+        #[cfg(feature = "tls")]
         let psk = match &config.security {
             SecurityMode::Plaintext => None,
             SecurityMode::Psk(psk) => Some(PskServerConfig::new(psk.clone())?),
@@ -160,6 +165,7 @@ impl ReceiverServer {
         Ok(Self {
             config,
             listener,
+            #[cfg(feature = "tls")]
             psk,
             managed_psk_path: None,
             panel,
@@ -212,13 +218,16 @@ impl ReceiverServer {
     }
 
     fn new_pairing(&mut self) -> Result<(), ServerError> {
-        if matches!(self.config.security, SecurityMode::Psk(_)) {
-            let psk = Psk::generate();
-            if let Some(path) = &self.managed_psk_path {
-                psk.store_atomic(path)?;
+        #[cfg(feature = "tls")]
+        {
+            if matches!(self.config.security, SecurityMode::Psk(_)) {
+                let psk = Psk::generate();
+                if let Some(path) = &self.managed_psk_path {
+                    psk.store_atomic(path)?;
+                }
+                self.psk = Some(PskServerConfig::new(psk.clone())?);
+                self.config.security = SecurityMode::Psk(psk);
             }
-            self.psk = Some(PskServerConfig::new(psk.clone())?);
-            self.config.security = SecurityMode::Psk(psk);
         }
         self.show_pairing_qr()
     }
@@ -315,6 +324,7 @@ impl ReceiverServer {
 
     fn serve_stream(&mut self, stream: TcpStream) -> Result<(), ServerError> {
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+        #[cfg(feature = "tls")]
         if let Some(psk) = &self.psk {
             // Bound an unauthenticated peer's opportunity to stall the PSK
             // handshake. Once authenticated, the short timeout drives frame
@@ -324,7 +334,7 @@ impl ReceiverServer {
             secured
                 .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(20)))?;
-            drive_connection(
+            return drive_connection(
                 &mut secured,
                 self.config.clone(),
                 self.panel.as_mut(),
@@ -333,21 +343,20 @@ impl ReceiverServer {
                 self.input.as_mut(),
                 #[cfg(target_os = "linux")]
                 self.power_key.as_ref(),
-            )
-        } else {
-            let mut plain = stream;
-            plain.set_read_timeout(Some(Duration::from_millis(20)))?;
-            drive_connection(
-                &mut plain,
-                self.config.clone(),
-                self.panel.as_mut(),
-                Some(self.pairing_frame.clone()),
-                #[cfg(target_os = "linux")]
-                self.input.as_mut(),
-                #[cfg(target_os = "linux")]
-                self.power_key.as_ref(),
-            )
+            );
         }
+        let mut plain = stream;
+        plain.set_read_timeout(Some(Duration::from_millis(20)))?;
+        drive_connection(
+            &mut plain,
+            self.config.clone(),
+            self.panel.as_mut(),
+            Some(self.pairing_frame.clone()),
+            #[cfg(target_os = "linux")]
+            self.input.as_mut(),
+            #[cfg(target_os = "linux")]
+            self.power_key.as_ref(),
+        )
     }
 }
 
@@ -538,8 +547,10 @@ pub enum ServerError {
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
+    #[cfg(feature = "tls")]
     PskConfig(#[from] rm_display_transport::PskConfigError),
     #[error(transparent)]
+    #[cfg(feature = "tls")]
     PskTransport(#[from] rm_display_transport::PskTransportError),
     #[error(transparent)]
     Wire(#[from] WireError),

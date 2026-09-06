@@ -7,8 +7,9 @@ license = "GPL-2.0-only"
 build = "build.rs"
 
 [features]
-default = []
+default = ["tls"]
 quill = []
+tls = ["dep:rm-display-transport"]
 
 [dependencies]
 bytes = "1.6"
@@ -17,8 +18,13 @@ qrcode = { version = "0.14.1", default-features = false }
 rand = "0.8"
 rm-display-core = { path = "../rm-display-core" }
 rm-display-protocol = { path = "../rm-display-protocol" }
-rm-display-transport = { path = "../rm-display-transport" }
+rm-display-transport = { path = "../rm-display-transport", optional = true }
 thiserror = "1.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[[bin]]
+name = "rm-display-receiver"
+path = "src/main.rs"
+required-features = ["tls"]

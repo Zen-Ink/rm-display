@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rm_display_core::{RefreshConfigError, RefreshPolicyConfig};
+#[cfg(feature = "tls")]
 use rm_display_transport::Psk;
 use thiserror::Error;
 
@@ -52,6 +53,7 @@ pub enum SecurityMode {
     /// never auto-detected or used as a fallback from a failed PSK handshake.
     Plaintext,
     /// TLS 1.3 external PSK with the protocol's fixed AES-128-GCM suite.
+    #[cfg(feature = "tls")]
     Psk(Psk),
 }
 
