@@ -17,11 +17,12 @@ use rm_display_protocol::{
 use thiserror::Error;
 
 use crate::events::write_event_jsonl;
-use crate::transport::ReadWrite;
-
 const MIN_MINOR: u32 = 0;
 const MAX_MINOR: u32 = 2;
 const SURFACE_ID: u32 = 1;
+
+pub trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
 
 #[derive(Debug, Clone)]
 pub struct Surface {

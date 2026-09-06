@@ -1,12 +1,9 @@
-use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::client::ReadWrite;
 use rm_display_transport::{Psk, PskClientConfig, PskConfigError, PskTransportError};
 use thiserror::Error;
-
-pub trait ReadWrite: Read + Write + Send {}
-impl<T: Read + Write + Send> ReadWrite for T {}
 
 #[derive(Debug, Error)]
 pub enum TransportError {
