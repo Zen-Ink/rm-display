@@ -180,14 +180,7 @@ impl PanelBackend for QuillPanel {
             std::slice::from_ref(&union)
         };
         let submitted_pixels = rect_pixels(submit_damage);
-        let mode = if self.color_capable {
-            refresh.waveform as i32
-        } else {
-            match refresh.waveform {
-                Waveform::Fastest => 0,
-                Waveform::Fast | Waveform::Quality | Waveform::FullQuality => 1,
-            }
-        };
+        let mode = quill_mode(self.color_capable, refresh.waveform);
         let swap_started = Instant::now();
         let native_damage = submit_damage
             .iter()
@@ -226,8 +219,9 @@ impl PanelBackend for QuillPanel {
         {
             let inflation = union_pixels as f64 / damage_pixels.max(1) as f64;
             eprintln!(
-                "rm-display-receiver: Quill timing waveform={:?} full={} status={} regions={} swaps={} damage={}px submitted={}px union={}px inflation={:.2}x framebuffer={:.2}ms swap={:.2}ms events={:.2}ms submit={:.2}ms",
+                "rm-display-receiver: Quill timing waveform={:?} mode={} full={} status={} regions={} swaps={} damage={}px submitted={}px union={}px inflation={:.2}x framebuffer={:.2}ms swap={:.2}ms events={:.2}ms submit={:.2}ms",
                 refresh.waveform,
+                mode,
                 refresh.complete_refresh,
                 accepted,
                 damage.len(),
@@ -253,6 +247,18 @@ impl PanelBackend for QuillPanel {
     fn pump(&mut self) -> Result<(), PanelError> {
         unsafe { quill_process_events() };
         Ok(())
+    }
+}
+
+fn quill_mode(color_capable: bool, waveform: Waveform) -> i32 {
+    if color_capable {
+        waveform as i32
+    } else {
+        match waveform {
+            Waveform::Fastest => 0,
+            Waveform::Fast => 1,
+            Waveform::Quality | Waveform::FullQuality => 3,
+        }
     }
 }
 
@@ -363,6 +369,14 @@ fn union_damage(rects: &[Rect]) -> Option<Rect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rm2_uses_gc16_for_quality_only() {
+        assert_eq!(quill_mode(false, Waveform::Fastest), 0);
+        assert_eq!(quill_mode(false, Waveform::Fast), 1);
+        assert_eq!(quill_mode(false, Waveform::Quality), 3);
+        assert_eq!(quill_mode(false, Waveform::FullQuality), 3);
+    }
 
     #[test]
     fn sparse_submission_avoids_large_fast_union_only() {
