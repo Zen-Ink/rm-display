@@ -519,14 +519,26 @@ impl ProducerClient {
         content_class: ContentClass,
     ) -> Result<FrameResult, ProducerError> {
         Ok(self
-            .send_frame_report_inner(
-                surface,
-                pixels,
-                Some((previous, tile)),
-                intent,
-                content_class,
-            )?
+            .send_delta_frame_report(surface, previous, pixels, tile, intent, content_class)?
             .result)
+    }
+
+    pub fn send_delta_frame_report(
+        &mut self,
+        surface: &Surface,
+        previous: &[u8],
+        pixels: &[u8],
+        tile: u32,
+        intent: FrameIntent,
+        content_class: ContentClass,
+    ) -> Result<FrameReport, ProducerError> {
+        self.send_frame_report_inner(
+            surface,
+            pixels,
+            Some((previous, tile)),
+            intent,
+            content_class,
+        )
     }
 
     pub fn send_frame_report(
@@ -577,6 +589,7 @@ impl ProducerClient {
         }
         let mut force_keyframe = self.logical_frame_id == 0;
         loop {
+            let build_started = Instant::now();
             let regions = if force_keyframe {
                 vec![encode_region(
                     Rect {
@@ -634,7 +647,6 @@ impl ProducerClient {
             } else {
                 self.logical_frame_id
             };
-            let build_started = Instant::now();
             let frame = Frame {
                 surface_id: surface.id,
                 generation: surface.generation,
