@@ -299,9 +299,9 @@ remain remote application actions; `ActionResult` completes every invocation.
 - FPS limiting retains pending work and arms a timer; it never returns early
   and forgets the final frame.
 - Local overlays are composed separately from the remote base surface.
-- Named profiles map semantic content and intent to waveforms. In particular,
-  Realtime uses Fastest for SETTLED, Animate uses Fast, and Balanced, Reading,
-  and Quality use Quality.
+- Named profiles map semantic content and intent to waveforms. Every named
+  profile uses a sparse Quality partial repaint for SETTLED; CUSTOM may select
+  a faster settled waveform explicitly.
 - A fast SETTLED remains an unsupersedable terminal barrier and presents the
   final pixels, but it is not a ghost-cleanup promise. Full-panel cleanup is a
 separate receiver decision driven by first-frame, periodic, large-damage,

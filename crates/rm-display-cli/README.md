@@ -96,10 +96,10 @@ pixels as `SETTLED` and waits for `PRESENTED`; partial frames are fatal. If the
 receiver reports `NEED_KEYFRAME`, the CLI retries the current pixels as a new
 full keyframe while preserving the original intent.
 
-SETTLED is always an unsupersedable terminal barrier. Its waveform follows the
-effective policy: Realtime uses Fastest, Animate uses Fast, and the other named
-presets use Quality; Custom uses its explicit settled waveform. A fast SETTLED
-does not itself request ghost cleanup. Each named profile has a distinct
+SETTLED is always an unsupersedable terminal barrier. Every named profile uses
+a sparse Quality partial repaint so motion-driven pixels converge to their
+exact grayscale; Custom uses its explicit settled waveform. A fast Custom
+SETTLED does not itself request ghost cleanup. Each named profile has a distinct
 actual-damage/idle cleanup budget; explicit periodic/static/manual and other
 receiver-owned rules can also decide when a complete refresh occurs.
 

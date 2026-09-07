@@ -1165,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_settled_repaints_accumulated_fastest_damage() {
+    fn realtime_settled_reconciles_accumulated_fastest_damage_with_quality() {
         let config = RefreshPolicyConfig {
             damage_tile: 2,
             ..RefreshPolicyConfig::for_profile(RefreshProfile::Realtime)
@@ -1210,7 +1210,7 @@ mod tests {
         )
         .unwrap();
         core.tick(Duration::from_millis(210), &mut panel).unwrap();
-        assert_eq!(panel.submissions()[1].refresh.waveform, Waveform::Fastest);
+        assert_eq!(panel.submissions()[1].refresh.waveform, Waveform::Quality);
 
         let quadrant = Rect {
             x: 0,
@@ -1236,7 +1236,7 @@ mod tests {
         core.tick(Duration::from_millis(710), &mut panel).unwrap();
         assert_eq!(panel.submissions().len(), 4);
         assert_eq!(panel.submissions()[3].damage, vec![quadrant.clone()]);
-        assert_eq!(panel.submissions()[3].refresh.waveform, Waveform::Fastest);
+        assert_eq!(panel.submissions()[3].refresh.waveform, Waveform::Quality);
         assert!(!panel.submissions()[3].refresh.complete_refresh);
 
         // Repeating an already-settled image is a logical presentation only,

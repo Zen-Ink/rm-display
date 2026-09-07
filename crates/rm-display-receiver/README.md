@@ -45,9 +45,9 @@ From fastest to highest quality, presets are `realtime`, `animate`, the default
 `balanced`, `reading`, and `quality`. Their receiver-local adaptive cleanup
 budgets are respectively 8/10 s, 6/8 s, 4/6 s, 3/5 s, and 2/4 s
 (panel-equivalents/idle time). Reading favors Quality for text/photos while
-keeping video Fast; quality uses Quality for every LATEST class. SETTLED
-follows the selected profile: Realtime uses Fastest, Animate uses Fast, and the
-other presets use Quality:
+keeping video Fast; quality uses Quality for every LATEST class. Every named
+profile uses a sparse Quality partial repaint at SETTLED so temporary motion
+pixels converge without a full-panel refresh:
 
 ```sh
 ./rm-display-receiver --epaper-profile=quality
@@ -58,7 +58,7 @@ the periodic trigger. `--damage-tile=PIXELS` controls receiver-side pixel
 damage granularity and defaults to 64. A final `SETTLED` includes dirty area
 accumulated by preceding fast updates, even when its pixels equal the last
 `LATEST` frame; its configured semantic waveform determines whether that
-repaint favors latency or clarity. Fast/Fastest SETTLED remains a final-frame
+repaint favors latency or clarity. A fast CUSTOM SETTLED remains a final-frame
 barrier but does not itself clean ghosting; adaptive idle, explicit overrides,
 first-frame, manual, and recovery policy decide full cleanup.
 

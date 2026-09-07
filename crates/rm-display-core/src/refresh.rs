@@ -93,9 +93,9 @@ impl RefreshPolicyConfig {
             RefreshProfile::Realtime => Self {
                 profile,
                 latest_text_waveform: Waveform::Fastest,
-                latest_photo_waveform: Waveform::Fastest,
+                latest_photo_waveform: Waveform::Quality,
                 latest_video_waveform: Waveform::Fastest,
-                settled_waveform: Waveform::Fastest,
+                settled_waveform: Waveform::Quality,
                 partial_refresh_enabled: true,
                 cleanup_after_updates: 0,
                 clean_first_frame: false,
@@ -108,7 +108,7 @@ impl RefreshPolicyConfig {
                 latest_text_waveform: Waveform::Fastest,
                 latest_photo_waveform: Waveform::Quality,
                 latest_video_waveform: Waveform::Fastest,
-                settled_waveform: Waveform::Fast,
+                settled_waveform: Waveform::Quality,
                 partial_refresh_enabled: true,
                 cleanup_after_updates: 0,
                 clean_first_frame: true,
@@ -401,13 +401,13 @@ mod tests {
         let cases = [
             (
                 RefreshProfile::Realtime,
-                [Waveform::Fastest, Waveform::Fastest, Waveform::Fastest],
-                Waveform::Fastest,
+                [Waveform::Fastest, Waveform::Quality, Waveform::Fastest],
+                Waveform::Quality,
             ),
             (
                 RefreshProfile::Animate,
                 [Waveform::Fastest, Waveform::Quality, Waveform::Fastest],
-                Waveform::Fast,
+                Waveform::Quality,
             ),
             (
                 RefreshProfile::Balanced,
@@ -522,12 +522,12 @@ mod tests {
     }
 
     #[test]
-    fn animate_settled_uses_fast_waveform() {
+    fn animate_settled_uses_quality_waveform() {
         let mut config = RefreshPolicyConfig::for_profile(RefreshProfile::Animate);
         config.clean_first_frame = false;
         let policy = RefreshPolicy::new(config).unwrap();
         let decision = policy.decide(FrameIntent::Settled, ContentClass::Video, 1, 100, false);
-        assert_eq!(decision.waveform, Waveform::Fast);
+        assert_eq!(decision.waveform, Waveform::Quality);
         assert!(!decision.complete_refresh);
     }
 

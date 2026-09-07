@@ -64,8 +64,8 @@ quality order.
 
 | Profile | adaptive cleanup | LATEST text | LATEST photo | LATEST video | SETTLED |
 | --- | --- | --- | --- | --- | --- |
-| REALTIME | 8 screens, 10 s idle | Fastest | Fastest | Fastest | Fastest |
-| ANIMATE | 6 screens, 8 s idle | Fastest | Quality | Fastest | Fast |
+| REALTIME | 8 screens, 10 s idle | Fastest | Quality | Fastest | Quality |
+| ANIMATE | 6 screens, 8 s idle | Fastest | Quality | Fastest | Quality |
 | BALANCED | 4 screens, 6 s idle | Fast | Quality | Fastest | Quality |
 | READING | 3 screens, 5 s idle | Quality | Quality | Fast | Quality |
 | QUALITY | 2 screens, 4 s idle | Quality | Quality | Quality | Quality |
@@ -87,9 +87,10 @@ reports the complete effective configuration and retains the latest valid
 CUSTOM policy for the current session so the local menu can switch back to it.
 
 SETTLED remains an unsupersedable terminal barrier under every profile.
-Realtime's Fastest, Animate's Fast, or a fast Custom SETTLED presents the exact
-final pixels but does not itself promise ghost cleanup. Periodic, static-fast-
-debt, large-area, named-profile adaptive-idle, first-frame, explicit, and recovery
+Named-profile SETTLED uses a sparse Quality partial repaint to restore exact
+grayscale without a full-panel flash. A fast Custom SETTLED presents the final
+pixels but does not itself promise ghost cleanup. Periodic, static-fast-debt,
+large-area, named-profile adaptive-idle, first-frame, explicit, and recovery
 policy remain the paths to a receiver-selected complete refresh.
 
 Named profiles have distinct receiver-local adaptive cleanup budgets shown in

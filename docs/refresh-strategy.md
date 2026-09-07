@@ -51,10 +51,11 @@ vendor QRegion transaction regardless of waveform; dense and complete updates
 use one bounding rectangle. Either path counts as one physical submission.
 
 When `partial_refresh_enabled=true` and no complete-refresh trigger is active,
-the update remains partial. A `SETTLED` frame is still partial; its waveform is
-profile-specific: Fastest for Realtime, Fast for Animate, and Quality for the
-other presets. Quality means the changed region is repainted accurately; it
-does not imply a full-panel flash.
+the update remains partial. A `SETTLED` frame is still partial; every named
+profile uses Quality so pixels temporarily driven by a motion waveform converge
+to their exact grayscale. Quality means only the accumulated sparse region is
+repainted accurately; it does not imply a full-panel flash. CUSTOM retains its
+explicit settled waveform.
 
 Fast/Fastest damage is retained as a settle region. The next `SETTLED` repaints
 that region with its selected settled waveform even if its pixels already
@@ -72,8 +73,8 @@ Quill. Zero-damage frames do not accrue cleanup debt.
 
 | Profile | LATEST text | LATEST photo | LATEST video | SETTLED | adaptive cleanup |
 | --- | --- | --- | --- | --- | --- |
-| Realtime | Fastest | Fastest | Fastest | Fastest | 8 screens, 10 s idle |
-| Animate | Fastest | Quality | Fastest | Fast | 6 screens, 8 s idle |
+| Realtime | Fastest | Quality | Fastest | Quality | 8 screens, 10 s idle |
+| Animate | Fastest | Quality | Fastest | Quality | 6 screens, 8 s idle |
 | Balanced | Fast | Quality | Fastest | Quality | 4 screens, 6 s idle |
 | Reading | Quality | Quality | Fast | Quality | 3 screens, 5 s idle |
 | Quality | Quality | Quality | Quality | Quality | 2 screens, 4 s idle |
