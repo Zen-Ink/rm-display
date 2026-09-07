@@ -134,6 +134,30 @@ impl PixelSurface {
         Ok(())
     }
 
+    pub(crate) fn copy_regions_from(
+        &mut self,
+        source: &Self,
+        regions: &[Rect],
+    ) -> Result<(), SurfaceError> {
+        if source.width != self.width
+            || source.height != self.height
+            || source.format != self.format
+        {
+            return Err(SurfaceError::BadLength);
+        }
+        let bytes_per_pixel = self.bytes_per_pixel();
+        for rect in regions {
+            validate_rect(self.width, self.height, rect)?;
+            let row_bytes = rect.width as usize * bytes_per_pixel;
+            for y in rect.y as usize..(rect.y + rect.height) as usize {
+                let start = (y * self.width as usize + rect.x as usize) * bytes_per_pixel;
+                self.pixels[start..start + row_bytes]
+                    .copy_from_slice(&source.pixels[start..start + row_bytes]);
+            }
+        }
+        Ok(())
+    }
+
     pub fn compose(&self, overlay: &LocalOverlay) -> Result<Self, SurfaceError> {
         if overlay.len() != pixel_len(self.width, self.height)? {
             return Err(SurfaceError::BadOverlay);
@@ -172,6 +196,57 @@ impl PixelSurface {
             PixelFormat::Unspecified | PixelFormat::Gray4 => unreachable!(),
         }
         Self::from_pixels_with_format(self.width, self.height, self.format, pixels)
+    }
+
+    pub(crate) fn compose_regions_into(
+        &self,
+        overlay: &LocalOverlay,
+        output: &mut Self,
+        regions: &[Rect],
+    ) -> Result<(), SurfaceError> {
+        if output.width != self.width
+            || output.height != self.height
+            || output.format != self.format
+        {
+            return Err(SurfaceError::BadLength);
+        }
+        if overlay.len() != pixel_len(self.width, self.height)? {
+            return Err(SurfaceError::BadOverlay);
+        }
+        let bytes_per_pixel = self.bytes_per_pixel();
+        if overlay.is_transparent() {
+            return output.copy_regions_from(self, regions);
+        }
+        for rect in regions {
+            validate_rect(self.width, self.height, rect)?;
+            for y in rect.y as usize..(rect.y + rect.height) as usize {
+                for x in rect.x as usize..(rect.x + rect.width) as usize {
+                    let index = y * self.width as usize + x;
+                    let luma = overlay.luma[index];
+                    let alpha = overlay.alpha[index];
+                    match self.format {
+                        PixelFormat::Gray8 => {
+                            output.pixels[index] = blend(self.pixels[index], luma, alpha);
+                        }
+                        PixelFormat::Rgb565Le => {
+                            let offset = index * bytes_per_pixel;
+                            let packed =
+                                u16::from_le_bytes([self.pixels[offset], self.pixels[offset + 1]]);
+                            output.pixels[offset..offset + 2].copy_from_slice(
+                                &pack_rgb565(
+                                    blend(expand5((packed >> 11) as u8), luma, alpha),
+                                    blend(expand6((packed >> 5) as u8), luma, alpha),
+                                    blend(expand5(packed as u8), luma, alpha),
+                                )
+                                .to_le_bytes(),
+                            );
+                        }
+                        PixelFormat::Unspecified | PixelFormat::Gray4 => unreachable!(),
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -261,6 +336,71 @@ pub fn tile_damage(previous: &PixelSurface, current: &PixelSurface, tile: u32) -
     damage
 }
 
+pub(crate) fn tile_damage_regions(
+    previous: &PixelSurface,
+    current: &PixelSurface,
+    tile: u32,
+    regions: &[Rect],
+) -> Vec<Rect> {
+    if previous.width != current.width
+        || previous.height != current.height
+        || previous.format != current.format
+        || tile == 0
+    {
+        return vec![Rect {
+            x: 0,
+            y: 0,
+            width: current.width,
+            height: current.height,
+        }];
+    }
+    let tile = tile as usize;
+    let width = current.width as usize;
+    let height = current.height as usize;
+    let bytes_per_pixel = current.bytes_per_pixel();
+    let tiles_x = width.div_ceil(tile);
+    let tiles_y = height.div_ceil(tile);
+    let mut candidates = vec![false; tiles_x * tiles_y];
+    for rect in regions {
+        let start_x = rect.x as usize / tile;
+        let start_y = rect.y as usize / tile;
+        let end_x = (rect.x as usize + rect.width as usize - 1) / tile;
+        let end_y = (rect.y as usize + rect.height as usize - 1) / tile;
+        for tile_y in start_y..=end_y {
+            for tile_x in start_x..=end_x {
+                candidates[tile_y * tiles_x + tile_x] = true;
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, candidate)| {
+            if !candidate {
+                return None;
+            }
+            let tile_x = index % tiles_x;
+            let tile_y = index / tiles_x;
+            let x = tile_x * tile;
+            let y = tile_y * tile;
+            let rect_width = tile.min(width - x);
+            let rect_height = tile.min(height - y);
+            let changed = (0..rect_height).any(|row| {
+                let offset = ((y + row) * width + x) * bytes_per_pixel;
+                let byte_width = rect_width * bytes_per_pixel;
+                previous.pixels[offset..offset + byte_width]
+                    != current.pixels[offset..offset + byte_width]
+            });
+            changed.then_some(Rect {
+                x: x as u32,
+                y: y as u32,
+                width: rect_width as u32,
+                height: rect_height as u32,
+            })
+        })
+        .collect()
+}
+
 fn pixel_len(width: u32, height: u32) -> Result<usize, SurfaceError> {
     if width == 0 || height == 0 {
         return Err(SurfaceError::InvalidGeometry);
@@ -278,19 +418,7 @@ fn validate_regions(
 ) -> Result<(), SurfaceError> {
     for region in regions {
         let rect = &region.rect;
-        if rect.width == 0
-            || rect.height == 0
-            || rect
-                .x
-                .checked_add(rect.width)
-                .is_none_or(|right| right > width)
-            || rect
-                .y
-                .checked_add(rect.height)
-                .is_none_or(|bottom| bottom > height)
-        {
-            return Err(SurfaceError::BadRegion);
-        }
+        validate_rect(width, height, rect)?;
         let expected = (rect.width as usize)
             .checked_mul(rect.height as usize)
             .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
@@ -307,6 +435,24 @@ fn validate_regions(
         }
     }
     Ok(())
+}
+
+fn validate_rect(width: u32, height: u32, rect: &Rect) -> Result<(), SurfaceError> {
+    if rect.width == 0
+        || rect.height == 0
+        || rect
+            .x
+            .checked_add(rect.width)
+            .is_none_or(|right| right > width)
+        || rect
+            .y
+            .checked_add(rect.height)
+            .is_none_or(|bottom| bottom > height)
+    {
+        Err(SurfaceError::BadRegion)
+    } else {
+        Ok(())
+    }
 }
 
 fn blend(background: u8, foreground: u8, alpha: u8) -> u8 {
@@ -411,5 +557,27 @@ mod tests {
         overlay.replace_planes(&[255, 0], &[255, 0]).unwrap();
         let composed = base.compose(&overlay).unwrap();
         assert_eq!(composed.pixels(), &[0xff, 0xff, 0x1f, 0x00]);
+    }
+
+    #[test]
+    fn partial_composition_and_damage_stay_inside_candidate_regions() {
+        let base = GraySurface::new(4, 4, 100).unwrap();
+        let overlay = LocalOverlay::transparent(4, 4).unwrap();
+        let mut output = GraySurface::new(4, 4, 255).unwrap();
+        let candidate = Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let previous = output.clone();
+        base.compose_regions_into(&overlay, &mut output, std::slice::from_ref(&candidate))
+            .unwrap();
+        assert_eq!(output.pixels()[0], 100);
+        assert_eq!(output.pixels()[15], 255);
+        assert_eq!(
+            tile_damage_regions(&previous, &output, 2, std::slice::from_ref(&candidate)),
+            vec![candidate]
+        );
     }
 }

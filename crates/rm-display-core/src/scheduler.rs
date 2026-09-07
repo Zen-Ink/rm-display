@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 use rm_display_protocol::{semantic::ValidatedFrame, ContentClass, FrameIntent, PixelFormat, Rect};
 use thiserror::Error;
 
+use crate::surface::tile_damage_regions;
 use crate::{
     tile_damage, FullRefreshReason, GraySurface, LocalOverlay, PanelBackend, PanelError,
     RefreshConfigError, RefreshDebt, RefreshPolicy, RefreshPolicyConfig, SurfaceError, Waveform,
@@ -90,6 +91,7 @@ struct PendingPresentation {
     force_cleanup: bool,
     decode_us: u32,
     decoded_bytes: usize,
+    damage_hint: Vec<Rect>,
 }
 
 /// Owns the logical remote base, local overlay, one pending presentation, and
@@ -98,6 +100,7 @@ pub struct DisplayCore {
     base: GraySurface,
     overlay: LocalOverlay,
     presented: GraySurface,
+    working: GraySurface,
     logical_frame_id: u64,
     presented_frame_id: u64,
     base_valid: bool,
@@ -152,6 +155,7 @@ impl DisplayCore {
             base: GraySurface::new_with_format(width, height, pixel_format)?,
             overlay: LocalOverlay::transparent(width, height)?,
             presented: GraySurface::new_with_format(width, height, pixel_format)?,
+            working: GraySurface::new_with_format(width, height, pixel_format)?,
             logical_frame_id: 0,
             presented_frame_id: 0,
             base_valid: false,
@@ -282,6 +286,7 @@ impl DisplayCore {
                 .damage_for_decision(decision, self.width(), self.height(), damage);
         panel.submit(&composed, &damage, decision)?;
         self.presented = composed;
+        self.working.clone_from(&self.presented);
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
         self.refresh_policy.presented(decision);
@@ -331,7 +336,22 @@ impl DisplayCore {
         self.logical_frame_id = frame.frame_id;
         self.base_valid = true;
 
-        let superseded = self.pending.take().map(|old| TerminalFrame {
+        let old_pending = self.pending.take();
+        let carry_full_damage = old_pending
+            .as_ref()
+            .is_some_and(|pending| pending.force_full_damage);
+        let carry_cleanup = old_pending
+            .as_ref()
+            .is_some_and(|pending| pending.force_cleanup);
+        let mut damage_hint = frame
+            .regions
+            .iter()
+            .map(|region| region.rect.clone())
+            .collect::<Vec<_>>();
+        if let Some(old) = old_pending.as_ref() {
+            damage_hint.extend(old.damage_hint.iter().cloned());
+        }
+        let superseded = old_pending.map(|old| TerminalFrame {
             frame_id: old.frame_id,
             outcome: PresentationOutcome::Superseded,
             metrics: PresentationMetrics {
@@ -345,10 +365,12 @@ impl DisplayCore {
             intent: frame.intent,
             content_class,
             accepted_at: now,
-            force_full_damage: keyframe && (self.presented_frame_id == 0 || recovering_base),
-            force_cleanup: keyframe && self.panel_state_uncertain,
+            force_full_damage: carry_full_damage
+                || keyframe && (self.presented_frame_id == 0 || recovering_base),
+            force_cleanup: carry_cleanup || keyframe && self.panel_state_uncertain,
             decode_us,
             decoded_bytes: frame.decoded_bytes,
+            damage_hint,
         });
         Ok(CommitReport {
             logical_frame_id: self.logical_frame_id,
@@ -526,11 +548,25 @@ impl DisplayCore {
             .expect("deadline requires pending frame");
         let present_started = Instant::now();
         let compose_started = Instant::now();
-        let composed = self.base.compose(&self.overlay)?;
+        let mut compose_regions = if pending.force_full_damage {
+            full_damage(self.width(), self.height())
+        } else {
+            pending.damage_hint.clone()
+        };
+        if pending.intent == FrameIntent::Settled {
+            compose_regions.extend(self.settle_damage.iter().cloned());
+        }
+        self.base
+            .compose_regions_into(&self.overlay, &mut self.working, &compose_regions)?;
         let mut damage = if pending.force_full_damage {
             full_damage(self.width(), self.height())
         } else {
-            tile_damage(&self.presented, &composed, self.damage_tile)
+            tile_damage_regions(
+                &self.presented,
+                &self.working,
+                self.damage_tile,
+                &compose_regions,
+            )
         };
         if pending.intent == FrameIntent::Settled {
             if let Some(debt) = self.settle_damage.as_ref() {
@@ -562,9 +598,15 @@ impl DisplayCore {
         if static_cleanup_due && decision.full_refresh_reason == FullRefreshReason::Forced {
             decision.full_refresh_reason = FullRefreshReason::StaticFastDebt;
         }
-        let damage =
+        let mut damage =
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);
+        if decision.complete_refresh {
+            let full = full_damage(self.width(), self.height());
+            self.base
+                .compose_regions_into(&self.overlay, &mut self.working, &full)?;
+            damage = full;
+        }
         let compose_us = elapsed_us(compose_started);
         let damage_pixels = damage.iter().fold(0_u64, |total, rect| {
             total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
@@ -587,7 +629,6 @@ impl DisplayCore {
         // high-quality SETTLED repaint.
         if damage.is_empty() {
             metrics.present_us = elapsed_us(present_started);
-            self.presented = composed;
             self.presented_frame_id = pending.frame_id;
             self.last_present_at = Some(now);
             return Ok(vec![TerminalFrame {
@@ -597,10 +638,11 @@ impl DisplayCore {
             }]);
         }
 
-        let panel_metrics = match panel.submit(&composed, &damage, decision) {
+        let panel_metrics = match panel.submit(&self.working, &damage, decision) {
             Ok(panel_metrics) => panel_metrics,
             Err(_) => {
                 metrics.present_us = elapsed_us(present_started);
+                self.working.clone_from(&self.presented);
                 self.mark_panel_failure();
                 return Ok(vec![TerminalFrame {
                     frame_id: pending.frame_id,
@@ -613,7 +655,8 @@ impl DisplayCore {
         metrics.submit_us = panel_metrics.submit_us;
         metrics.present_us = elapsed_us(present_started);
 
-        self.presented = composed;
+        std::mem::swap(&mut self.presented, &mut self.working);
+        self.working.copy_regions_from(&self.presented, &damage)?;
         self.presented_frame_id = pending.frame_id;
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
@@ -766,6 +809,73 @@ mod tests {
         assert_eq!(superseded.outcome, PresentationOutcome::Superseded);
         assert!(superseded.metrics.queue_us <= 1_100);
         assert_eq!(core.logical_frame_id(), 2);
+    }
+
+    #[test]
+    fn superseded_delta_keeps_all_unpresented_damage_hints() {
+        let config = RefreshPolicyConfig {
+            damage_tile: 2,
+            clean_first_frame: false,
+            ..RefreshPolicyConfig::default()
+        };
+        let mut core = DisplayCore::new(4, 4, 400, Duration::from_millis(200), config).unwrap();
+        let mut panel = MockPanel::new(4, 4);
+        core.commit(
+            &region_frame(
+                1,
+                0,
+                FrameIntent::Latest,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                vec![0; 16],
+            ),
+            ContentClass::TextUi,
+            Duration::ZERO,
+        )
+        .unwrap();
+        core.tick(Duration::ZERO, &mut panel).unwrap();
+        core.commit(
+            &region_frame(
+                2,
+                1,
+                FrameIntent::Latest,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 2,
+                    height: 2,
+                },
+                vec![1; 4],
+            ),
+            ContentClass::TextUi,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        core.commit(
+            &region_frame(
+                3,
+                2,
+                FrameIntent::Latest,
+                Rect {
+                    x: 2,
+                    y: 2,
+                    width: 2,
+                    height: 2,
+                },
+                vec![2; 4],
+            ),
+            ContentClass::TextUi,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        core.tick(Duration::from_millis(250), &mut panel).unwrap();
+        assert_eq!(panel.submissions()[1].damage.len(), 2);
+        assert_eq!(panel.submissions()[1].pixels[0], 1);
+        assert_eq!(panel.submissions()[1].pixels[15], 2);
     }
 
     #[test]
