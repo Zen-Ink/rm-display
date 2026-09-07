@@ -171,7 +171,6 @@ impl PanelBackend for QuillPanel {
             clustered_damage.len(),
             clustered_pixels,
             union_pixels,
-            refresh.waveform,
             refresh.complete_refresh,
         );
         let submit_damage = if sparse {
@@ -276,11 +275,9 @@ fn use_sparse_damage(
     region_count: usize,
     submitted_pixels: u64,
     union_pixels: u64,
-    waveform: Waveform,
     complete_refresh: bool,
 ) -> bool {
     !complete_refresh
-        && waveform == Waveform::Fastest
         && region_count >= 2
         && union_pixels
             > submitted_pixels
@@ -379,42 +376,11 @@ mod tests {
     }
 
     #[test]
-    fn sparse_submission_avoids_large_fast_union_only() {
-        assert!(use_sparse_damage(
-            15,
-            15_360,
-            466_944,
-            Waveform::Fastest,
-            false
-        ));
-        assert!(!use_sparse_damage(
-            15,
-            15_360,
-            46_000,
-            Waveform::Fastest,
-            false
-        ));
-        assert!(!use_sparse_damage(
-            15,
-            15_360,
-            466_944,
-            Waveform::Quality,
-            false
-        ));
-        assert!(!use_sparse_damage(
-            15,
-            15_360,
-            466_944,
-            Waveform::Fastest,
-            true
-        ));
-        assert!(!use_sparse_damage(
-            1,
-            1_024,
-            100_000,
-            Waveform::Fastest,
-            false
-        ));
+    fn sparse_submission_avoids_large_partial_unions() {
+        assert!(use_sparse_damage(15, 15_360, 466_944, false));
+        assert!(!use_sparse_damage(15, 15_360, 46_000, false));
+        assert!(!use_sparse_damage(15, 15_360, 466_944, true));
+        assert!(!use_sparse_damage(1, 1_024, 100_000, false));
     }
 
     #[test]
@@ -433,7 +399,6 @@ mod tests {
             clusters.len(),
             rect_pixels(&tiles),
             rect_pixels(&[union_damage(&tiles).unwrap()]),
-            Waveform::Fastest,
             false
         ));
 

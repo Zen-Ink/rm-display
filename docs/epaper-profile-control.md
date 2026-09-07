@@ -64,7 +64,7 @@ quality order.
 
 | Profile | cleanup_after_updates | large threshold | static fast debt | LATEST text | LATEST photo | LATEST video | SETTLED |
 | --- | ---: | ---: | ---: | --- | --- | --- | --- |
-| REALTIME | disabled | disabled | disabled | Fastest | Fastest | Fastest | Fast |
+| REALTIME | disabled | disabled | disabled | Fastest | Fastest | Fastest | Fastest |
 | ANIMATE | 180 | disabled | 8 | Fastest | Quality | Fastest | Fast |
 | BALANCED | 90 | disabled | 6 | Fast | Quality | Fastest | Quality |
 | READING | 45 | 50% | 3 | Quality | Quality | Fast | Quality |
@@ -84,13 +84,13 @@ reports the complete effective configuration and retains the latest valid
 CUSTOM policy for the current session so the local menu can switch back to it.
 
 SETTLED remains an unsupersedable terminal barrier under every profile.
-Realtime's Fast, Animate's Fast, or a fast Custom SETTLED presents the exact
+Realtime's Fastest, Animate's Fast, or a fast Custom SETTLED presents the exact
 final pixels but does not itself promise ghost cleanup. Periodic, static-fast-
 debt, large-area, Realtime adaptive-idle, first-frame, explicit, and recovery
 policy remain the paths to a receiver-selected complete refresh.
 
-Realtime additionally has a receiver-local adaptive cleanup: two
-panel-equivalents of successful partial damage followed by three idle seconds
+Realtime additionally has a receiver-local adaptive cleanup: eight
+panel-equivalents of successful partial damage followed by ten idle seconds
 with no active pen. This internal physical-panel policy is deliberately not a
 producer-configurable profile field.
 

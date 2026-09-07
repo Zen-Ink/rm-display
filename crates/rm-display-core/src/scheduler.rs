@@ -10,8 +10,8 @@ use crate::{
     SurfaceError, Waveform,
 };
 
-const REALTIME_CLEANUP_IDLE: Duration = Duration::from_secs(3);
-const REALTIME_CLEANUP_SCREEN_EQUIVALENTS: u64 = 2;
+const REALTIME_CLEANUP_IDLE: Duration = Duration::from_secs(10);
+const REALTIME_CLEANUP_SCREEN_EQUIVALENTS: u64 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationOutcome {
@@ -654,14 +654,11 @@ impl DisplayCore {
         if static_cleanup_due && decision.full_refresh_reason == FullRefreshReason::Forced {
             decision.full_refresh_reason = FullRefreshReason::StaticFastDebt;
         }
-        // A Fastest SETTLED frame is only an ordering barrier. Do
-        // not repaint historical fast tiles with the same fast waveform.
-        let damage =
-            if pending.intent == FrameIntent::Settled && decision.waveform != Waveform::Fastest {
-                decision_damage
-            } else {
-                damage
-            };
+        let damage = if pending.intent == FrameIntent::Settled {
+            decision_damage
+        } else {
+            damage
+        };
         let mut damage =
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);
@@ -727,9 +724,7 @@ impl DisplayCore {
         self.panel_state_uncertain = false;
         self.refresh_policy
             .presented_submissions(decision, panel_metrics.physical_submissions);
-        if decision.complete_refresh
-            || pending.intent == FrameIntent::Settled && decision.waveform != Waveform::Fastest
-        {
+        if decision.complete_refresh || pending.intent == FrameIntent::Settled {
             self.settle_damage.clear();
             self.fast_updates_since_settled = 0;
         } else if matches!(decision.waveform, Waveform::Fastest | Waveform::Fast) {
@@ -1158,7 +1153,7 @@ mod tests {
     }
 
     #[test]
-    fn realtime_settled_repaints_fastest_damage_with_fast_waveform() {
+    fn realtime_settled_repaints_accumulated_fastest_damage() {
         let config = RefreshPolicyConfig {
             damage_tile: 2,
             ..RefreshPolicyConfig::for_profile(RefreshProfile::Realtime)
@@ -1203,7 +1198,7 @@ mod tests {
         )
         .unwrap();
         core.tick(Duration::from_millis(210), &mut panel).unwrap();
-        assert_eq!(panel.submissions()[1].refresh.waveform, Waveform::Fast);
+        assert_eq!(panel.submissions()[1].refresh.waveform, Waveform::Fastest);
 
         let quadrant = Rect {
             x: 0,
@@ -1229,7 +1224,7 @@ mod tests {
         core.tick(Duration::from_millis(710), &mut panel).unwrap();
         assert_eq!(panel.submissions().len(), 4);
         assert_eq!(panel.submissions()[3].damage, vec![quadrant.clone()]);
-        assert_eq!(panel.submissions()[3].refresh.waveform, Waveform::Fast);
+        assert_eq!(panel.submissions()[3].refresh.waveform, Waveform::Fastest);
         assert!(!panel.submissions()[3].refresh.complete_refresh);
 
         // Repeating an already-settled image is a logical presentation only,
@@ -1247,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn fastest_settled_is_a_barrier_without_repainting_fast_damage() {
+    fn fastest_settled_repaints_and_clears_fast_damage() {
         let config = RefreshPolicyConfig {
             settled_waveform: Waveform::Fastest,
             clean_first_frame: false,
@@ -1274,9 +1269,9 @@ mod tests {
         )
         .unwrap();
         let terminal = core.tick(Duration::from_millis(210), &mut panel).unwrap();
-        assert_eq!(terminal[0].metrics.damage_pixels, 0);
-        assert_eq!(panel.submissions().len(), 1);
-        assert_eq!(core.fast_updates_since_settled(), 1);
+        assert_eq!(terminal[0].metrics.damage_pixels, 4);
+        assert_eq!(panel.submissions().len(), 2);
+        assert_eq!(core.fast_updates_since_settled(), 0);
     }
 
     #[test]
@@ -1303,11 +1298,29 @@ mod tests {
         .unwrap();
         core.tick(Duration::from_millis(250), &mut panel).unwrap();
 
-        core.tick(Duration::from_millis(3_249), &mut panel).unwrap();
-        assert_eq!(panel.submissions().len(), 2);
-        core.tick(Duration::from_millis(3_250), &mut panel).unwrap();
-        assert_eq!(panel.submissions().len(), 3);
-        assert!(panel.submissions()[2].refresh.complete_refresh);
+        for frame_id in 3..=8 {
+            let now = Duration::from_millis(frame_id * 250);
+            core.commit(
+                &frame(
+                    frame_id,
+                    frame_id - 1,
+                    FrameIntent::Latest,
+                    vec![frame_id as u8; 4],
+                ),
+                ContentClass::TextUi,
+                now,
+            )
+            .unwrap();
+            core.tick(now, &mut panel).unwrap();
+        }
+
+        core.tick(Duration::from_millis(11_999), &mut panel)
+            .unwrap();
+        assert_eq!(panel.submissions().len(), 8);
+        core.tick(Duration::from_millis(12_000), &mut panel)
+            .unwrap();
+        assert_eq!(panel.submissions().len(), 9);
+        assert!(panel.submissions()[8].refresh.complete_refresh);
         assert_eq!(core.partial_damage_pixels_since_cleanup, 0);
     }
 

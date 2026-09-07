@@ -46,15 +46,15 @@ frame rules.
 
 The receiver composites the remote base and local overlay, compares the result
 against the last physically presented surface in 64-pixel tiles, and submits
-only changed damage. Sparse Fastest damage is clustered and sent through one
-vendor QRegion transaction; dense, quality, and complete updates use one
-bounding rectangle. Either path counts as one physical submission.
+only changed damage. Sparse partial damage is clustered and sent through one
+vendor QRegion transaction regardless of waveform; dense and complete updates
+use one bounding rectangle. Either path counts as one physical submission.
 
 When `partial_refresh_enabled=true` and no complete-refresh trigger is active,
 the update remains partial. A `SETTLED` frame is still partial; its waveform is
-profile-specific: Fast for Realtime and Animate, and Quality for the other
-presets. Quality means the changed region is repainted accurately; it does not
-imply a full-panel flash.
+profile-specific: Fastest for Realtime, Fast for Animate, and Quality for the
+other presets. Quality means the changed region is repainted accurately; it
+does not imply a full-panel flash.
 
 Fast/Fastest damage is retained as a settle region. The next `SETTLED` repaints
 that region with its selected settled waveform even if its pixels already
@@ -72,7 +72,7 @@ Quill. Zero-damage frames do not accrue cleanup debt.
 
 | Profile | LATEST text | LATEST photo | LATEST video | SETTLED | periodic | large area | static fast debt |
 | --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| Realtime | Fastest | Fastest | Fastest | Fast | adaptive idle | off | off |
+| Realtime | Fastest | Fastest | Fastest | Fastest | adaptive idle | off | off |
 | Animate | Fastest | Quality | Fastest | Fast | 180 | off | 8 |
 | Balanced | Fast | Quality | Fastest | Quality | 90 | off | 6 |
 | Reading | Quality | Quality | Fast | Quality | 45 | 50% | 3 |
@@ -82,10 +82,11 @@ Fastest, Fast, Quality, and FullQuality map to current Quill mode values 0, 1,
 3, and 4. For a complete refresh, the Quality profile uses FullQuality; other
 named profiles and Custom use Quality plus the complete-refresh flag.
 
-Realtime cleanup is receiver-local: after at least two panel-equivalents of
-successful partial damage, it waits for three seconds with no pen or pending
-frame before one complete cleanup. It is intentionally not a producer-side
-counter and does not change the wire protocol.
+Realtime cleanup is receiver-local: remote frames and overlays
+all contribute their successfully submitted partial damage. After at least
+eight panel-equivalents, it waits for ten seconds with no pen or pending frame
+before one complete cleanup. It is intentionally not a producer-side counter
+and does not change the wire protocol.
 
 Protocol v2.2 CUSTOM supplies all four semantic waveform columns,
 partial-refresh permission, all three automatic cleanup parameters,

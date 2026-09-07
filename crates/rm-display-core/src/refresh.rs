@@ -95,7 +95,7 @@ impl RefreshPolicyConfig {
                 latest_text_waveform: Waveform::Fastest,
                 latest_photo_waveform: Waveform::Fastest,
                 latest_video_waveform: Waveform::Fastest,
-                settled_waveform: Waveform::Fast,
+                settled_waveform: Waveform::Fastest,
                 partial_refresh_enabled: true,
                 cleanup_after_updates: 0,
                 clean_first_frame: false,
@@ -402,7 +402,7 @@ mod tests {
             (
                 RefreshProfile::Realtime,
                 [Waveform::Fastest, Waveform::Fastest, Waveform::Fastest],
-                Waveform::Fast,
+                Waveform::Fastest,
             ),
             (
                 RefreshProfile::Animate,

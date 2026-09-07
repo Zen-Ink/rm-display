@@ -46,7 +46,7 @@ cleanup, all LATEST content Fastest), `animate` (180), the default `balanced`
 (90), `reading` (45 and a 50% large-damage trigger), and `quality` (20 and a
 33% trigger). Reading favors Quality for text/photos while keeping video Fast;
 quality uses Quality for every LATEST class. SETTLED follows the selected
-profile: Realtime and Animate use Fast, and the other presets use
+profile: Realtime uses Fastest, Animate uses Fast, and the other presets use
 Quality:
 
 ```sh

@@ -300,7 +300,7 @@ remain remote application actions; `ActionResult` completes every invocation.
   and forgets the final frame.
 - Local overlays are composed separately from the remote base surface.
 - Named profiles map semantic content and intent to waveforms. In particular,
-  Realtime and Animate use Fast for SETTLED, and Balanced, Reading,
+  Realtime uses Fastest for SETTLED, Animate uses Fast, and Balanced, Reading,
   and Quality use Quality.
 - A fast SETTLED remains an unsupersedable terminal barrier and presents the
   final pixels, but it is not a ghost-cleanup promise. Full-panel cleanup is a
