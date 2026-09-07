@@ -103,7 +103,7 @@ changing the protocol.
 ## Build and lifecycle
 
 Host builds never link the ARM Quill library. Cross builds require an SDK
-environment that provides the compiler and sysroot plus `RMPP_QUILL_LIB_DIR`.
+environment that provides the compiler and sysroot plus `QUILL_LIB_DIR`.
 No absolute toolchain path is stored in Cargo configuration or the Makefile.
 
 Takeover is supervised so systemd `ExecStopPost` restores xochitl after normal

@@ -8,5 +8,14 @@ rustflags = [
     "-C", "link-arg=-mbranch-protection=standard",
 ]
 
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-remarkable-linux-gnueabi-gcc"
+rustflags = [
+    "-C", "target-cpu=cortex-a7",
+    "-C", "link-arg=-mcpu=cortex-a7",
+    "-C", "link-arg=-mfpu=neon",
+    "-C", "link-arg=-mfloat-abi=hard",
+]
+
 [net]
 git-fetch-with-cli = true

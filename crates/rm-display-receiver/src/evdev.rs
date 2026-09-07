@@ -186,6 +186,24 @@ pub struct LinuxInputEvent {
     pub value: i32,
 }
 
+#[cfg(target_os = "linux")]
+fn kernel_input_event_size() -> usize {
+    std::mem::size_of::<libc::timeval>() + 8
+}
+
+#[cfg(target_os = "linux")]
+fn decode_kernel_input_event(bytes: &[u8]) -> Option<LinuxInputEvent> {
+    let offset = std::mem::size_of::<libc::timeval>();
+    if bytes.len() != offset + 8 {
+        return None;
+    }
+    Some(LinuxInputEvent {
+        event_type: u16::from_ne_bytes(bytes[offset..offset + 2].try_into().ok()?),
+        code: u16::from_ne_bytes(bytes[offset + 2..offset + 4].try_into().ok()?),
+        value: i32::from_ne_bytes(bytes[offset + 4..offset + 8].try_into().ok()?),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerPhase {
     Down,
@@ -200,6 +218,38 @@ pub struct PhysicalPointerEvent {
     pub contact_id: u32,
     pub x: u32,
     pub y: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TouchTransform {
+    invert_x: bool,
+    invert_y: bool,
+}
+
+impl TouchTransform {
+    fn for_device_name(name: &str) -> Self {
+        // RM2's `pt_mt` X axis follows the framebuffer, while its Y axis runs
+        // from the physical bottom towards the top. This is also the mapping
+        // used by the native RM2 input stack. Do not apply it to the Paper Pro
+        // touch devices, whose kernel coordinates already match Quill.
+        if name.trim().eq_ignore_ascii_case("pt_mt") {
+            Self {
+                invert_y: true,
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match (self.invert_x, self.invert_y) {
+            (false, false) => "identity",
+            (true, false) => "invert-x",
+            (false, true) => "invert-y",
+            (true, true) => "rotate-180",
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -324,6 +374,7 @@ pub struct TypeBParser {
     raw_max_y: i32,
     panel_width: u32,
     panel_height: u32,
+    transform: TouchTransform,
     dropped: bool,
 }
 
@@ -340,6 +391,27 @@ impl TypeBParser {
         panel_width: u32,
         panel_height: u32,
     ) -> Self {
+        Self::with_ranges_and_transform(
+            raw_min_x,
+            raw_max_x,
+            raw_min_y,
+            raw_max_y,
+            panel_width,
+            panel_height,
+            TouchTransform::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_ranges_and_transform(
+        raw_min_x: i32,
+        raw_max_x: i32,
+        raw_min_y: i32,
+        raw_max_y: i32,
+        panel_width: u32,
+        panel_height: u32,
+        transform: TouchTransform,
+    ) -> Self {
         Self {
             slots: array::from_fn(|_| Slot::default()),
             current_slot: 0,
@@ -350,6 +422,7 @@ impl TypeBParser {
             raw_max_y: raw_max_y.max(raw_min_y.saturating_add(1)),
             panel_width: panel_width.max(1),
             panel_height: panel_height.max(1),
+            transform,
             dropped: false,
         }
     }
@@ -420,6 +493,7 @@ impl TypeBParser {
                         self.raw_max_y,
                         self.panel_width,
                         self.panel_height,
+                        self.transform,
                     ));
                 }
                 *slot = Slot::default();
@@ -455,6 +529,7 @@ impl TypeBParser {
                 self.raw_max_y,
                 self.panel_width,
                 self.panel_height,
+                self.transform,
             ));
             if slot.pending_up {
                 *slot = Slot::default();
@@ -479,11 +554,18 @@ fn map_event(
     raw_max_y: i32,
     panel_width: u32,
     panel_height: u32,
+    transform: TouchTransform,
 ) -> PhysicalPointerEvent {
-    let x = (raw_x.clamp(raw_min_x, raw_max_x) - raw_min_x) as i64 * (panel_width - 1) as i64
+    let mut x = (raw_x.clamp(raw_min_x, raw_max_x) - raw_min_x) as i64 * (panel_width - 1) as i64
         / (raw_max_x - raw_min_x) as i64;
-    let y = (raw_y.clamp(raw_min_y, raw_max_y) - raw_min_y) as i64 * (panel_height - 1) as i64
+    let mut y = (raw_y.clamp(raw_min_y, raw_max_y) - raw_min_y) as i64 * (panel_height - 1) as i64
         / (raw_max_y - raw_min_y) as i64;
+    if transform.invert_x {
+        x = (panel_width - 1) as i64 - x;
+    }
+    if transform.invert_y {
+        y = (panel_height - 1) as i64 - y;
+    }
     PhysicalPointerEvent {
         phase,
         contact_id,
@@ -772,6 +854,7 @@ fn power_key_loop(fd: RawFd, stop_fd: RawFd, event_fd: RawFd) {
         },
     ];
     let mut buffer = [0_u8; 24 * 16];
+    let input_event_size = kernel_input_event_size();
     'running: loop {
         let result = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, -1) };
         if result < 0 {
@@ -801,10 +884,18 @@ fn power_key_loop(fd: RawFd, stop_fd: RawFd, event_fd: RawFd) {
             if count == 0 {
                 break 'running;
             }
-            for event in buffer[..count as usize].chunks_exact(24) {
-                let event_type = u16::from_ne_bytes(event[16..18].try_into().unwrap());
-                let code = u16::from_ne_bytes(event[18..20].try_into().unwrap());
-                let value = i32::from_ne_bytes(event[20..24].try_into().unwrap());
+            if count as usize % input_event_size != 0 {
+                break 'running;
+            }
+            for bytes in buffer[..count as usize].chunks_exact(input_event_size) {
+                let Some(event) = decode_kernel_input_event(bytes) else {
+                    break 'running;
+                };
+                let LinuxInputEvent {
+                    event_type,
+                    code,
+                    value,
+                } = event;
                 if event_type == EV_KEY && code == KEY_POWER && value == 1 {
                     let one = 1_u64.to_ne_bytes();
                     let written = unsafe { libc::write(event_fd, one.as_ptr().cast(), one.len()) };
@@ -860,6 +951,7 @@ pub struct EvdevTouchDevice {
     parser: TypeBParser,
     path: PathBuf,
     name: String,
+    transform: TouchTransform,
 }
 
 #[cfg(target_os = "linux")]
@@ -902,6 +994,7 @@ impl EvdevTouchDevice {
                 };
             }
         }
+        let transform = TouchTransform::for_device_name(&name);
         if unsafe { libc::ioctl(fd, EVIOCGRAB, 1_i32) } != 0 {
             let error = io::Error::last_os_error();
             unsafe { libc::close(fd) };
@@ -909,16 +1002,18 @@ impl EvdevTouchDevice {
         }
         Ok(Self {
             fd,
-            parser: TypeBParser::with_ranges(
+            parser: TypeBParser::with_ranges_and_transform(
                 x.minimum,
                 x.maximum,
                 y.minimum,
                 y.maximum,
                 panel_width,
                 panel_height,
+                transform,
             ),
             path: path.to_path_buf(),
             name,
+            transform,
         })
     }
 
@@ -930,6 +1025,10 @@ impl EvdevTouchDevice {
         &self.name
     }
 
+    pub fn transform_description(&self) -> &'static str {
+        self.transform.description()
+    }
+
     pub(crate) fn event_fd(&self) -> RawFd {
         self.fd
     }
@@ -937,6 +1036,7 @@ impl EvdevTouchDevice {
     pub fn drain_reports(&mut self) -> io::Result<Vec<Vec<PhysicalPointerEvent>>> {
         let mut reports = Vec::new();
         let mut buffer = [0_u8; 24 * 64];
+        let input_event_size = kernel_input_event_size();
         loop {
             let count = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count < 0 {
@@ -952,18 +1052,17 @@ impl EvdevTouchDevice {
             if count == 0 {
                 break;
             }
-            if count as usize % 24 != 0 {
+            if count as usize % input_event_size != 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "evdev read was not aligned to 64-bit input_event",
+                    format!("evdev read was not aligned to {input_event_size}-byte input_event"),
                 ));
             }
-            for event in buffer[..count as usize].chunks_exact(24) {
-                let output = self.parser.push(LinuxInputEvent {
-                    event_type: u16::from_ne_bytes(event[16..18].try_into().unwrap()),
-                    code: u16::from_ne_bytes(event[18..20].try_into().unwrap()),
-                    value: i32::from_ne_bytes(event[20..24].try_into().unwrap()),
-                });
+            for bytes in buffer[..count as usize].chunks_exact(input_event_size) {
+                let event = decode_kernel_input_event(bytes).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid kernel input_event")
+                })?;
+                let output = self.parser.push(event);
                 if !output.is_empty() {
                     reports.push(output);
                 }
@@ -1166,6 +1265,32 @@ mod tests {
         parser.push(event(EV_ABS, ABS_MT_POSITION_Y, 2200));
         let maximum = parser.push(event(EV_SYN, SYN_REPORT, 0));
         assert_eq!((maximum[0].x, maximum[0].y), (100, 200));
+    }
+
+    #[test]
+    fn rm2_pt_mt_inverts_only_the_y_axis() {
+        let transform = TouchTransform::for_device_name("pt_mt");
+        assert_eq!(transform.description(), "invert-y");
+        let mut parser =
+            TypeBParser::with_ranges_and_transform(100, 1100, 200, 2200, 101, 201, transform);
+        parser.push(event(EV_ABS, ABS_MT_TRACKING_ID, 1));
+        parser.push(event(EV_ABS, ABS_MT_POSITION_X, 100));
+        parser.push(event(EV_ABS, ABS_MT_POSITION_Y, 200));
+        let raw_minimum = parser.push(event(EV_SYN, SYN_REPORT, 0));
+        assert_eq!((raw_minimum[0].x, raw_minimum[0].y), (0, 200));
+
+        parser.push(event(EV_ABS, ABS_MT_POSITION_X, 1100));
+        parser.push(event(EV_ABS, ABS_MT_POSITION_Y, 2200));
+        let raw_maximum = parser.push(event(EV_SYN, SYN_REPORT, 0));
+        assert_eq!((raw_maximum[0].x, raw_maximum[0].y), (100, 0));
+    }
+
+    #[test]
+    fn paper_pro_touch_mapping_remains_unchanged() {
+        assert_eq!(
+            TouchTransform::for_device_name("Elan touch input"),
+            TouchTransform::default()
+        );
     }
 
     #[test]

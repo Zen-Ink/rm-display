@@ -98,14 +98,22 @@ fn create_panel(mock_geometry: Option<(u32, u32)>) -> Result<Box<dyn PanelBacken
         return Ok(Box::new(MockPanel::new(width, height)));
     }
 
-    #[cfg(all(feature = "quill", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(all(
+        feature = "quill",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "arm")
+    ))]
     {
         return rm_display_receiver::quill::QuillPanel::open()
             .map(|panel| Box::new(panel) as Box<dyn PanelBackend>)
             .map_err(|error| error.to_string());
     }
 
-    #[cfg(not(all(feature = "quill", target_os = "linux", target_arch = "aarch64")))]
+    #[cfg(not(all(
+        feature = "quill",
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "arm")
+    )))]
     Err("this build has no Quill backend; pass --mock WIDTHxHEIGHT for host development".into())
 }
 

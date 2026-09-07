@@ -15,7 +15,11 @@ use rm_display_transport::{Psk, PskServerConfig};
 use thiserror::Error;
 
 use crate::config::{ConfigError, ReceiverConfig, SecurityMode};
-#[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "quill"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "quill",
+    any(target_arch = "aarch64", target_arch = "arm")
+))]
 use crate::evdev::discover_remarkable_touch_device;
 #[cfg(target_os = "linux")]
 use crate::evdev::EvdevTouchDevice;
@@ -125,9 +129,10 @@ impl ReceiverServer {
                 let info = panel.info();
                 let device = EvdevTouchDevice::open(path, info.width, info.height)?;
                 let status = format!(
-                    "touch input enabled: {} ({:?}; explicit --input)",
+                    "touch input enabled: {} ({:?}; transform={}; explicit --input)",
                     device.path().display(),
-                    device.name()
+                    device.name(),
+                    device.transform_description()
                 );
                 (Some(device), status)
             }
@@ -335,7 +340,11 @@ impl ReceiverServer {
     }
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "quill"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "quill",
+    any(target_arch = "aarch64", target_arch = "arm")
+))]
 fn auto_open_power_key() -> (Option<PowerKeyDevice>, String) {
     match PowerKeyDevice::discover_open() {
         Ok(device) => {
@@ -352,16 +361,20 @@ fn auto_open_power_key() -> (Option<PowerKeyDevice>, String) {
 
 #[cfg(all(
     target_os = "linux",
-    not(all(target_arch = "aarch64", feature = "quill"))
+    not(all(feature = "quill", any(target_arch = "aarch64", target_arch = "arm")))
 ))]
 fn auto_open_power_key() -> (Option<PowerKeyDevice>, String) {
     (
         None,
-        "power-key menu disabled: only enabled for reMarkable AArch64 Quill builds".into(),
+        "power-key menu disabled: only enabled for reMarkable Quill builds".into(),
     )
 }
 
-#[cfg(all(target_os = "linux", target_arch = "aarch64", feature = "quill"))]
+#[cfg(all(
+    target_os = "linux",
+    feature = "quill",
+    any(target_arch = "aarch64", target_arch = "arm")
+))]
 fn auto_open_touch(panel: &dyn PanelBackend) -> (Option<EvdevTouchDevice>, String) {
     let candidate = match discover_remarkable_touch_device() {
         Ok(candidate) => candidate,
@@ -371,9 +384,10 @@ fn auto_open_touch(panel: &dyn PanelBackend) -> (Option<EvdevTouchDevice>, Strin
     match EvdevTouchDevice::open(&candidate.path, info.width, info.height) {
         Ok(device) => {
             let status = format!(
-                "touch input enabled: {} ({:?}; automatic discovery)",
+                "touch input enabled: {} ({:?}; transform={}; automatic discovery)",
                 device.path().display(),
-                device.name()
+                device.name(),
+                device.transform_description()
             );
             (Some(device), status)
         }
@@ -390,13 +404,12 @@ fn auto_open_touch(panel: &dyn PanelBackend) -> (Option<EvdevTouchDevice>, Strin
 
 #[cfg(all(
     target_os = "linux",
-    not(all(target_arch = "aarch64", feature = "quill"))
+    not(all(feature = "quill", any(target_arch = "aarch64", target_arch = "arm")))
 ))]
 fn auto_open_touch(_panel: &dyn PanelBackend) -> (Option<EvdevTouchDevice>, String) {
     (
         None,
-        "touch input disabled: automatic discovery is limited to reMarkable AArch64 Quill builds"
-            .into(),
+        "touch input disabled: automatic discovery is limited to reMarkable Quill builds".into(),
     )
 }
 

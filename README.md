@@ -60,20 +60,24 @@ control. Pass the environment setup file and Quill checkout explicitly:
 SDK_ENV=/path/to/environment-setup-cortexa53-crypto-remarkable-linux \
 QUILL_DIR=quill \
   make receiver-aarch64
+SDK_ENV=/path/to/environment-setup-cortexa7hf-neon-remarkable-linux-gnueabi \
+QUILL_DIR=quill \
+  make receiver-rm2
 ```
 
 Clone with `--recurse-submodules`, or run `git submodule update --init` after
 an ordinary clone. Quill's proprietary vendor dependency is not distributed;
-place the matching device `libqsgepaper.so` at
-`quill/vendor/libqsgepaper.so` before cross-building. The Makefile builds only
-the embeddable Quill shared library before linking the receiver.
+place the matching device `libqsgepaper.so` under `quill/vendor/aarch64/` or
+`quill/vendor/armv7/` before cross-building. Quill writes `libquill.so` to the
+matching `quill/build/<architecture>/` directory; the Makefile then copies both
+libraries beside the receiver binary.
 
-The SDK environment must put `aarch64-remarkable-linux-gcc` on `PATH` and
-provide its sysroot variables. The Cargo configuration names only that linker;
+The SDK environment must put the target reMarkable compiler on `PATH` and
+provide its sysroot variables. The Cargo configuration names only the linker;
 it does not embed a local toolchain or sysroot path.
 
-Run `make receiver-takeover` to produce
-`dist/rm-display-receiver-aarch64.tar.gz`. The archive includes the AppLoad
+Run `make receiver-takeover` or `make receiver-rm2-takeover` to produce the
+matching architecture archive under `dist/`. The archive includes the AppLoad
 manifest, takeover entry point, receiver, Quill libraries, and the receiver's
 GPL-2.0-only license. The executable uses an `$ORIGIN` RPATH so colocated
 libraries are found when it is launched directly.

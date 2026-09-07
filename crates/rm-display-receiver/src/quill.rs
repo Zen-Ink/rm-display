@@ -1,6 +1,7 @@
 //! Single-threaded Quill/libqsgepaper panel backend.
 
 use std::marker::PhantomData;
+use std::os::raw::c_ulong;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
@@ -8,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use rm_display_core::{
     GraySurface, PanelBackend, PanelError, PanelInfo, PanelSubmissionMetrics, RefreshDecision,
+    Waveform,
 };
 use rm_display_protocol::{PixelFormat, Rect};
 
@@ -20,6 +22,7 @@ unsafe extern "C" {
     fn quill_stride() -> i32;
     fn quill_format() -> i32;
     fn quill_buffer() -> *mut u8;
+    fn quill_capabilities() -> u32;
     fn quill_swap_ex(
         x: i32,
         y: i32,
@@ -28,7 +31,7 @@ unsafe extern "C" {
         mode: i32,
         full: i32,
         color: i32,
-    ) -> u64;
+    ) -> c_ulong;
     fn quill_process_events();
 }
 
@@ -38,6 +41,7 @@ pub struct QuillPanel {
     format: NativePixelFormat,
     buffer: NonNull<u8>,
     buffer_len: usize,
+    color_capable: bool,
     _single_thread: PhantomData<Rc<()>>,
 }
 
@@ -49,15 +53,23 @@ impl QuillPanel {
                 "quill_init returned {status}"
             )));
         }
-        let (width, height, stride, qt_format, pointer) = unsafe {
+        let (width, height, stride, qt_format, capabilities, pointer) = unsafe {
             (
                 quill_width(),
                 quill_height(),
                 quill_stride(),
                 quill_format(),
+                quill_capabilities(),
                 quill_buffer(),
             )
         };
+        const QUILL_CAPABILITY_MONO: u32 = 1 << 0;
+        const QUILL_CAPABILITY_COLOR: u32 = 1 << 1;
+        if capabilities & QUILL_CAPABILITY_MONO == 0 {
+            return Err(PanelError::Unsupported(
+                "Quill does not report monochrome capability".into(),
+            ));
+        }
         if width <= 0 || height <= 0 || stride <= 0 {
             return Err(PanelError::Unsupported(
                 "Quill returned invalid geometry".into(),
@@ -81,7 +93,8 @@ impl QuillPanel {
             format,
             NativePixelFormat::Rgb565 | NativePixelFormat::Bgra32 | NativePixelFormat::Rgba32
         );
-        let color_rgb565 = native_color && is_color_remarkable();
+        let color_capable = capabilities & QUILL_CAPABILITY_COLOR != 0;
+        let color_rgb565 = native_color && color_capable;
         eprintln!(
             "rm-display-receiver: Quill RGB565 protocol output {}",
             if color_rgb565 { "enabled" } else { "disabled" }
@@ -96,20 +109,10 @@ impl QuillPanel {
             format,
             buffer,
             buffer_len,
+            color_capable,
             _single_thread: PhantomData,
         })
     }
-}
-
-fn is_color_remarkable() -> bool {
-    let Ok(machine) = std::fs::read_to_string("/sys/devices/soc0/machine") else {
-        return false;
-    };
-    let machine = machine.to_ascii_lowercase();
-    machine.contains("ferrari")
-        || machine.contains("chiappa")
-        || machine.contains("tatsu")
-        || machine.contains("paper pro")
 }
 
 impl PanelBackend for QuillPanel {
@@ -150,13 +153,21 @@ impl PanelBackend for QuillPanel {
         let union =
             union_damage(damage).ok_or_else(|| PanelError::Submit("empty damage".into()))?;
         let submit_started = Instant::now();
+        let mode = if self.color_capable {
+            refresh.waveform as i32
+        } else {
+            match refresh.waveform {
+                Waveform::Fastest => 0,
+                Waveform::Fast | Waveform::Quality | Waveform::FullQuality => 1,
+            }
+        };
         let marker = unsafe {
             quill_swap_ex(
                 union.x as i32,
                 union.y as i32,
                 union.width as i32,
                 union.height as i32,
-                refresh.waveform as i32,
+                mode,
                 i32::from(refresh.complete_refresh),
                 i32::from(frame.format() == PixelFormat::Rgb565Le),
             )
