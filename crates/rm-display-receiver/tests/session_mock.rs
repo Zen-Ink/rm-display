@@ -712,7 +712,7 @@ fn appended_realtime_and_reading_profiles_map_to_effective_presets() {
         Some(Body::EpaperProfileResult(result))
             if result.active.as_ref().is_some_and(|state|
                 state.profile == EpaperProfile::Realtime as i32
-                    && state.cleanup_after_updates == 360
+                    && state.cleanup_after_updates == 0
                     && state.large_update_threshold_percent == 0)
     ));
 

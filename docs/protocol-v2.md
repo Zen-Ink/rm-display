@@ -300,12 +300,13 @@ remain remote application actions; `ActionResult` completes every invocation.
   and forgets the final frame.
 - Local overlays are composed separately from the remote base surface.
 - Named profiles map semantic content and intent to waveforms. In particular,
-  Realtime uses Fastest for SETTLED, Animate uses Fast, and Balanced, Reading,
+  Realtime and Animate use Fast for SETTLED, and Balanced, Reading,
   and Quality use Quality.
 - A fast SETTLED remains an unsupersedable terminal barrier and presents the
   final pixels, but it is not a ghost-cleanup promise. Full-panel cleanup is a
-  separate receiver decision driven by first-frame, periodic, large-damage,
-  static-fast-debt, explicit/profile, partial-disabled, or recovery policy.
+separate receiver decision driven by first-frame, periodic, large-damage,
+static-fast-debt, Realtime adaptive-idle, explicit/profile, partial-disabled,
+or recovery policy.
 - Quill/native state is owned by one panel actor. A successful submit advances
   `presented_frame_id`; a zero-damage frame may also advance it without a
   redundant panel operation.

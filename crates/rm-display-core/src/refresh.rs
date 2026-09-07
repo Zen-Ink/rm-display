@@ -95,12 +95,12 @@ impl RefreshPolicyConfig {
                 latest_text_waveform: Waveform::Fastest,
                 latest_photo_waveform: Waveform::Fastest,
                 latest_video_waveform: Waveform::Fastest,
-                settled_waveform: Waveform::Fastest,
+                settled_waveform: Waveform::Fast,
                 partial_refresh_enabled: true,
-                cleanup_after_updates: 360,
-                clean_first_frame: true,
+                cleanup_after_updates: 0,
+                clean_first_frame: false,
                 large_update_threshold_percent: 0,
-                static_cleanup_after_fast_updates: 12,
+                static_cleanup_after_fast_updates: 0,
                 damage_tile: 64,
             },
             RefreshProfile::Animate => Self {
@@ -387,7 +387,7 @@ mod tests {
         let balanced = RefreshPolicyConfig::for_profile(RefreshProfile::Balanced);
         let reading = RefreshPolicyConfig::for_profile(RefreshProfile::Reading);
         let quality = RefreshPolicyConfig::for_profile(RefreshProfile::Quality);
-        assert_eq!(realtime.cleanup_after_updates, 360);
+        assert_eq!(realtime.cleanup_after_updates, 0);
         assert_eq!(animate.cleanup_after_updates, 180);
         assert_eq!(balanced.cleanup_after_updates, 90);
         assert_eq!(reading.cleanup_after_updates, 45);
@@ -402,7 +402,7 @@ mod tests {
             (
                 RefreshProfile::Realtime,
                 [Waveform::Fastest, Waveform::Fastest, Waveform::Fastest],
-                Waveform::Fastest,
+                Waveform::Fast,
             ),
             (
                 RefreshProfile::Animate,
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(preset.cleanup_after_updates, 45);
         assert_eq!(preset.large_update_threshold_percent, 50);
         let realtime = preset.switched_to(RefreshProfile::Realtime);
-        assert_eq!(realtime.cleanup_after_updates, 360);
+        assert_eq!(realtime.cleanup_after_updates, 0);
         assert_eq!(realtime.large_update_threshold_percent, 0);
     }
 

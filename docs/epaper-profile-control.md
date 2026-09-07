@@ -64,7 +64,7 @@ quality order.
 
 | Profile | cleanup_after_updates | large threshold | static fast debt | LATEST text | LATEST photo | LATEST video | SETTLED |
 | --- | ---: | ---: | ---: | --- | --- | --- | --- |
-| REALTIME | 360 | disabled | 12 | Fastest | Fastest | Fastest | Fastest |
+| REALTIME | disabled | disabled | disabled | Fastest | Fastest | Fastest | Fast |
 | ANIMATE | 180 | disabled | 8 | Fastest | Quality | Fastest | Fast |
 | BALANCED | 90 | disabled | 6 | Fast | Quality | Fastest | Quality |
 | READING | 45 | 50% | 3 | Quality | Quality | Fast | Quality |
@@ -84,10 +84,15 @@ reports the complete effective configuration and retains the latest valid
 CUSTOM policy for the current session so the local menu can switch back to it.
 
 SETTLED remains an unsupersedable terminal barrier under every profile.
-Realtime's Fastest, Animate's Fast, or a fast Custom SETTLED presents the exact
+Realtime's Fast, Animate's Fast, or a fast Custom SETTLED presents the exact
 final pixels but does not itself promise ghost cleanup. Periodic, static-fast-
-debt, large-area, first-frame, explicit, and recovery policy remain the only
-paths to a receiver-selected complete refresh.
+debt, large-area, Realtime adaptive-idle, first-frame, explicit, and recovery
+policy remain the paths to a receiver-selected complete refresh.
+
+Realtime additionally has a receiver-local adaptive cleanup: two
+panel-equivalents of successful partial damage followed by three idle seconds
+with no active pen. This internal physical-panel policy is deliberately not a
+producer-configurable profile field.
 
 Profile switching retains `partial_refresh_enabled`, `clean_first_frame`, and
 damage-tile settings. Cleanup interval, large-area threshold, and static fast

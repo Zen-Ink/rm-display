@@ -41,12 +41,12 @@ capability bits, and axis ranges. It never assumes a fixed `eventN`. Use
 which device was grabbed or why touch input is disabled.
 
 The receiver owns native Quill mapping and every complete-refresh decision.
-From fastest to highest quality, presets are `realtime` (360 partial
-updates, all LATEST content Fastest), `animate` (180), the default `balanced`
+From fastest to highest quality, presets are `realtime` (adaptive idle
+cleanup, all LATEST content Fastest), `animate` (180), the default `balanced`
 (90), `reading` (45 and a 50% large-damage trigger), and `quality` (20 and a
 33% trigger). Reading favors Quality for text/photos while keeping video Fast;
 quality uses Quality for every LATEST class. SETTLED follows the selected
-profile: Realtime uses Fastest, Animate uses Fast, and the other presets use
+profile: Realtime and Animate use Fast, and the other presets use
 Quality:
 
 ```sh

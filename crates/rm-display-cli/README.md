@@ -97,10 +97,10 @@ receiver reports `NEED_KEYFRAME`, the CLI retries the current pixels as a new
 full keyframe while preserving the original intent.
 
 SETTLED is always an unsupersedable terminal barrier. Its waveform follows the
-effective policy: Realtime uses Fastest, Animate uses Fast, and the other named
+effective policy: Realtime and Animate use Fast, and the other named
 presets use Quality; Custom uses its explicit settled waveform. A fast SETTLED
-does not itself request ghost cleanup. Periodic/static/manual and other
-receiver-owned rules decide when a complete refresh occurs.
+does not itself request ghost cleanup. Adaptive/periodic/static/manual and
+other receiver-owned rules decide when a complete refresh occurs.
 
 If `--psk-file` is present, any PSK/TLS failure is fatal; the CLI never retries
 that connection as plaintext.

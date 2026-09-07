@@ -6,8 +6,12 @@ use thiserror::Error;
 use crate::surface::tile_damage_regions;
 use crate::{
     tile_damage, FullRefreshReason, GraySurface, LocalOverlay, PanelBackend, PanelError,
-    RefreshConfigError, RefreshDebt, RefreshPolicy, RefreshPolicyConfig, SurfaceError, Waveform,
+    RefreshConfigError, RefreshDebt, RefreshDecision, RefreshPolicy, RefreshPolicyConfig,
+    SurfaceError, Waveform,
 };
+
+const REALTIME_CLEANUP_IDLE: Duration = Duration::from_secs(3);
+const REALTIME_CLEANUP_SCREEN_EQUIVALENTS: u64 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationOutcome {
@@ -120,6 +124,8 @@ pub struct DisplayCore {
     /// even when their pixels equal the latest frame.
     settle_damage: Vec<Rect>,
     fast_updates_since_settled: u32,
+    partial_damage_pixels_since_cleanup: u64,
+    last_partial_at: Option<Duration>,
 }
 
 impl DisplayCore {
@@ -169,6 +175,8 @@ impl DisplayCore {
             force_cleanup_next: false,
             settle_damage: Vec::new(),
             fast_updates_since_settled: 0,
+            partial_damage_pixels_since_cleanup: 0,
+            last_partial_at: None,
         })
     }
 
@@ -241,6 +249,30 @@ impl DisplayCore {
         self.force_cleanup_next = true;
     }
 
+    fn record_panel_damage(&mut self, decision: RefreshDecision, damage: &[Rect], now: Duration) {
+        if decision.complete_refresh {
+            self.partial_damage_pixels_since_cleanup = 0;
+            self.last_partial_at = None;
+        } else {
+            self.partial_damage_pixels_since_cleanup = self
+                .partial_damage_pixels_since_cleanup
+                .saturating_add(damage_pixels(damage));
+            self.last_partial_at = Some(now);
+        }
+    }
+
+    fn realtime_cleanup_due(&self, now: Duration) -> bool {
+        self.refresh_policy.config().profile == crate::RefreshProfile::Realtime
+            && self.presented_frame_id != 0
+            && self.partial_damage_pixels_since_cleanup
+                >= u64::from(self.width())
+                    .saturating_mul(u64::from(self.height()))
+                    .saturating_mul(REALTIME_CLEANUP_SCREEN_EQUIVALENTS)
+            && self
+                .last_partial_at
+                .is_some_and(|last| now.saturating_sub(last) >= REALTIME_CLEANUP_IDLE)
+    }
+
     pub fn update_refresh_config(
         &mut self,
         config: RefreshPolicyConfig,
@@ -285,6 +317,7 @@ impl DisplayCore {
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);
         let panel_metrics = panel.submit(&composed, &damage, decision)?;
+        self.record_panel_damage(decision, &damage, now);
         self.presented = composed;
         self.working.clone_from(&self.presented);
         self.last_present_at = Some(now);
@@ -507,6 +540,7 @@ impl DisplayCore {
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
         self.refresh_policy.presented(decision);
+        self.record_panel_damage(decision, &damage, now);
         self.force_cleanup_next = false;
         self.settle_damage.clear();
         self.fast_updates_since_settled = 0;
@@ -520,6 +554,9 @@ impl DisplayCore {
         now: Duration,
         panel: &mut dyn PanelBackend,
     ) -> Result<Vec<TerminalFrame>, CoreError> {
+        if self.pending.is_none() && self.realtime_cleanup_due(now) {
+            return Ok(self.request_cleanup(now, panel)?.terminals);
+        }
         self.tick_inner(now, panel, false)
     }
 
@@ -678,6 +715,7 @@ impl DisplayCore {
                 }]);
             }
         };
+        self.record_panel_damage(decision, &damage, now);
         metrics.convert_us = panel_metrics.convert_us;
         metrics.submit_us = panel_metrics.submit_us;
         metrics.present_us = elapsed_us(present_started);
@@ -1120,10 +1158,10 @@ mod tests {
     }
 
     #[test]
-    fn settled_repaints_fast_damage_without_falling_back_to_full_panel() {
+    fn realtime_settled_repaints_fastest_damage_with_fast_waveform() {
         let config = RefreshPolicyConfig {
             damage_tile: 2,
-            ..RefreshPolicyConfig::default()
+            ..RefreshPolicyConfig::for_profile(RefreshProfile::Realtime)
         };
         let mut core = DisplayCore::new(4, 4, 400, Duration::from_millis(200), config).unwrap();
         let mut panel = MockPanel::new(4, 4);
@@ -1147,6 +1185,26 @@ mod tests {
         .unwrap();
         core.tick(Duration::ZERO, &mut panel).unwrap();
 
+        core.commit(
+            &region_frame(
+                2,
+                1,
+                FrameIntent::Settled,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                vec![1; 16],
+            ),
+            ContentClass::TextUi,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        core.tick(Duration::from_millis(210), &mut panel).unwrap();
+        assert_eq!(panel.submissions()[1].refresh.waveform, Waveform::Fast);
+
         let quadrant = Rect {
             x: 0,
             y: 0,
@@ -1154,38 +1212,38 @@ mod tests {
             height: 2,
         };
         core.commit(
-            &region_frame(2, 1, FrameIntent::Latest, quadrant.clone(), vec![2; 4]),
+            &region_frame(3, 2, FrameIntent::Latest, quadrant.clone(), vec![2; 4]),
             ContentClass::TextUi,
-            Duration::from_millis(10),
-        )
-        .unwrap();
-        core.tick(Duration::from_millis(250), &mut panel).unwrap();
-        assert_eq!(panel.submissions()[1].refresh.waveform, Waveform::Fast);
-
-        core.commit(
-            &region_frame(3, 2, FrameIntent::Settled, quadrant.clone(), vec![2; 4]),
-            ContentClass::TextUi,
-            Duration::from_millis(260),
+            Duration::from_millis(220),
         )
         .unwrap();
         core.tick(Duration::from_millis(460), &mut panel).unwrap();
-        assert_eq!(panel.submissions().len(), 3);
-        assert_eq!(panel.submissions()[2].damage, vec![quadrant.clone()]);
-        assert_eq!(panel.submissions()[2].refresh.waveform, Waveform::Quality);
-        assert!(!panel.submissions()[2].refresh.complete_refresh);
+        assert_eq!(panel.submissions()[2].refresh.waveform, Waveform::Fastest);
 
-        // Repeating an already-settled image is a logical presentation only,
-        // not an accidental full-screen refresh.
         core.commit(
-            &region_frame(4, 3, FrameIntent::Settled, quadrant, vec![2; 4]),
+            &region_frame(4, 3, FrameIntent::Settled, quadrant.clone(), vec![2; 4]),
             ContentClass::TextUi,
             Duration::from_millis(470),
         )
         .unwrap();
-        let terminal = core.tick(Duration::from_millis(670), &mut panel).unwrap();
+        core.tick(Duration::from_millis(710), &mut panel).unwrap();
+        assert_eq!(panel.submissions().len(), 4);
+        assert_eq!(panel.submissions()[3].damage, vec![quadrant.clone()]);
+        assert_eq!(panel.submissions()[3].refresh.waveform, Waveform::Fast);
+        assert!(!panel.submissions()[3].refresh.complete_refresh);
+
+        // Repeating an already-settled image is a logical presentation only,
+        // not an accidental full-screen refresh.
+        core.commit(
+            &region_frame(5, 4, FrameIntent::Settled, quadrant, vec![2; 4]),
+            ContentClass::TextUi,
+            Duration::from_millis(720),
+        )
+        .unwrap();
+        let terminal = core.tick(Duration::from_millis(970), &mut panel).unwrap();
         assert_eq!(terminal[0].metrics.damage_pixels, 0);
-        assert_eq!(panel.submissions().len(), 3);
-        assert_eq!(core.presented_frame_id(), 4);
+        assert_eq!(panel.submissions().len(), 4);
+        assert_eq!(core.presented_frame_id(), 5);
     }
 
     #[test]
@@ -1219,6 +1277,38 @@ mod tests {
         assert_eq!(terminal[0].metrics.damage_pixels, 0);
         assert_eq!(panel.submissions().len(), 1);
         assert_eq!(core.fast_updates_since_settled(), 1);
+    }
+
+    #[test]
+    fn realtime_cleanup_uses_actual_damage_and_an_idle_deadline() {
+        let config = RefreshPolicyConfig {
+            damage_tile: 2,
+            ..RefreshPolicyConfig::for_profile(RefreshProfile::Realtime)
+        };
+        let mut core = DisplayCore::new(2, 2, 400, Duration::from_millis(200), config).unwrap();
+        let mut panel = MockPanel::new(2, 2);
+
+        core.commit(
+            &frame(1, 0, FrameIntent::Latest, vec![1; 4]),
+            ContentClass::TextUi,
+            Duration::ZERO,
+        )
+        .unwrap();
+        core.tick(Duration::ZERO, &mut panel).unwrap();
+        core.commit(
+            &frame(2, 1, FrameIntent::Latest, vec![2; 4]),
+            ContentClass::TextUi,
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        core.tick(Duration::from_millis(250), &mut panel).unwrap();
+
+        core.tick(Duration::from_millis(3_249), &mut panel).unwrap();
+        assert_eq!(panel.submissions().len(), 2);
+        core.tick(Duration::from_millis(3_250), &mut panel).unwrap();
+        assert_eq!(panel.submissions().len(), 3);
+        assert!(panel.submissions()[2].refresh.complete_refresh);
+        assert_eq!(core.partial_damage_pixels_since_cleanup, 0);
     }
 
     #[test]
