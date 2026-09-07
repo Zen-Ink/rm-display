@@ -219,9 +219,10 @@ impl PanelBackend for QuillPanel {
         let events_us = duration_us(events_started.elapsed());
         let submit_us = duration_us(submit_started.elapsed());
         let now = Instant::now();
-        if self
-            .last_timing_log
-            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        if refresh.waveform != Waveform::Fastest
+            || self
+                .last_timing_log
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
         {
             let inflation = union_pixels as f64 / damage_pixels.max(1) as f64;
             eprintln!(

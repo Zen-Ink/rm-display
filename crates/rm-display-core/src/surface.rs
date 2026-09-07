@@ -220,6 +220,14 @@ impl PixelSurface {
         for rect in regions {
             validate_rect(self.width, self.height, rect)?;
             for y in rect.y as usize..(rect.y + rect.height) as usize {
+                let left = y * self.width as usize + rect.x as usize;
+                let right = left + rect.width as usize;
+                if overlay.alpha[left..right].iter().all(|alpha| *alpha == 0) {
+                    let left = left * bytes_per_pixel;
+                    let right = right * bytes_per_pixel;
+                    output.pixels[left..right].copy_from_slice(&self.pixels[left..right]);
+                    continue;
+                }
                 for x in rect.x as usize..(rect.x + rect.width) as usize {
                     let index = y * self.width as usize + x;
                     let luma = overlay.luma[index];
@@ -579,5 +587,25 @@ mod tests {
             tile_damage_regions(&previous, &output, 2, std::slice::from_ref(&candidate)),
             vec![candidate]
         );
+    }
+
+    #[test]
+    fn partial_composition_copies_rows_outside_a_nonempty_overlay() {
+        let base = GraySurface::from_pixels(4, 1, vec![10, 20, 30, 40]).unwrap();
+        let mut overlay = LocalOverlay::transparent(4, 1).unwrap();
+        overlay.replace_planes(&[0; 4], &[255, 0, 0, 0]).unwrap();
+        let mut output = GraySurface::new(4, 1, 255).unwrap();
+        base.compose_regions_into(
+            &overlay,
+            &mut output,
+            &[Rect {
+                x: 1,
+                y: 0,
+                width: 3,
+                height: 1,
+            }],
+        )
+        .unwrap();
+        assert_eq!(output.pixels(), &[255, 20, 30, 40]);
     }
 }
