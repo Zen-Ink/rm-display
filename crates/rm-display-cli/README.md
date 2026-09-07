@@ -99,8 +99,9 @@ full keyframe while preserving the original intent.
 SETTLED is always an unsupersedable terminal barrier. Its waveform follows the
 effective policy: Realtime uses Fastest, Animate uses Fast, and the other named
 presets use Quality; Custom uses its explicit settled waveform. A fast SETTLED
-does not itself request ghost cleanup. Adaptive/periodic/static/manual and
-other receiver-owned rules decide when a complete refresh occurs.
+does not itself request ghost cleanup. Each named profile has a distinct
+actual-damage/idle cleanup budget; explicit periodic/static/manual and other
+receiver-owned rules can also decide when a complete refresh occurs.
 
 If `--psk-file` is present, any PSK/TLS failure is fatal; the CLI never retries
 that connection as plaintext.

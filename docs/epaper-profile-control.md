@@ -62,19 +62,22 @@ The enum keeps its original wire values (`ANIMATE=1`, `BALANCED=2`,
 `QUALITY=3`) and appends `REALTIME=4`, `READING=5`, and `CUSTOM=6`. Numeric order is not
 quality order.
 
-| Profile | cleanup_after_updates | large threshold | static fast debt | LATEST text | LATEST photo | LATEST video | SETTLED |
-| --- | ---: | ---: | ---: | --- | --- | --- | --- |
-| REALTIME | disabled | disabled | disabled | Fastest | Fastest | Fastest | Fastest |
-| ANIMATE | 180 | disabled | 8 | Fastest | Quality | Fastest | Fast |
-| BALANCED | 90 | disabled | 6 | Fast | Quality | Fastest | Quality |
-| READING | 45 | 50% | 3 | Quality | Quality | Fast | Quality |
-| QUALITY | 20 | 33% | disabled | Quality | Quality | Quality | Quality |
+| Profile | adaptive cleanup | LATEST text | LATEST photo | LATEST video | SETTLED |
+| --- | --- | --- | --- | --- | --- |
+| REALTIME | 8 screens, 10 s idle | Fastest | Fastest | Fastest | Fastest |
+| ANIMATE | 6 screens, 8 s idle | Fastest | Quality | Fastest | Fast |
+| BALANCED | 4 screens, 6 s idle | Fast | Quality | Fastest | Quality |
+| READING | 3 screens, 5 s idle | Quality | Quality | Fast | Quality |
+| QUALITY | 2 screens, 4 s idle | Quality | Quality | Quality | Quality |
 
 When cleanup is due, QUALITY selects FullQuality and the other named presets
 and Custom select Quality; the receiver separately forces a complete panel
 refresh.
-Intervals count successful physical partial submissions. `clean_first_frame`
-and 64-pixel damage tiles remain the defaults for every preset.
+Named presets disable periodic, large-area, and static-fast-debt cleanup by
+default. Their adaptive budgets count actual submitted partial damage from
+remote frames and overlays, then wait until the configured idle time has
+elapsed. Sixty-four-pixel damage tiles remain the
+default for every preset.
 
 CUSTOM requires Fastest, Fast, or Quality for LATEST text/mixed, photo, video,
 and SETTLED; FullQuality is not exposed. It also carries partial permission,
@@ -86,13 +89,12 @@ CUSTOM policy for the current session so the local menu can switch back to it.
 SETTLED remains an unsupersedable terminal barrier under every profile.
 Realtime's Fastest, Animate's Fast, or a fast Custom SETTLED presents the exact
 final pixels but does not itself promise ghost cleanup. Periodic, static-fast-
-debt, large-area, Realtime adaptive-idle, first-frame, explicit, and recovery
+debt, large-area, named-profile adaptive-idle, first-frame, explicit, and recovery
 policy remain the paths to a receiver-selected complete refresh.
 
-Realtime additionally has a receiver-local adaptive cleanup: eight
-panel-equivalents of successful partial damage followed by ten idle seconds
-with no active pen. This internal physical-panel policy is deliberately not a
-producer-configurable profile field.
+Named profiles have distinct receiver-local adaptive cleanup budgets shown in
+the table. This internal physical-panel policy is deliberately not a
+producer-configurable profile field and does not change the wire protocol.
 
 Profile switching retains `partial_refresh_enabled`, `clean_first_frame`, and
 damage-tile settings. Cleanup interval, large-area threshold, and static fast

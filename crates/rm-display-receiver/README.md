@@ -41,13 +41,13 @@ capability bits, and axis ranges. It never assumes a fixed `eventN`. Use
 which device was grabbed or why touch input is disabled.
 
 The receiver owns native Quill mapping and every complete-refresh decision.
-From fastest to highest quality, presets are `realtime` (adaptive idle
-cleanup, all LATEST content Fastest), `animate` (180), the default `balanced`
-(90), `reading` (45 and a 50% large-damage trigger), and `quality` (20 and a
-33% trigger). Reading favors Quality for text/photos while keeping video Fast;
-quality uses Quality for every LATEST class. SETTLED follows the selected
-profile: Realtime uses Fastest, Animate uses Fast, and the other presets use
-Quality:
+From fastest to highest quality, presets are `realtime`, `animate`, the default
+`balanced`, `reading`, and `quality`. Their receiver-local adaptive cleanup
+budgets are respectively 8/10 s, 6/8 s, 4/6 s, 3/5 s, and 2/4 s
+(panel-equivalents/idle time). Reading favors Quality for text/photos while
+keeping video Fast; quality uses Quality for every LATEST class. SETTLED
+follows the selected profile: Realtime uses Fastest, Animate uses Fast, and the
+other presets use Quality:
 
 ```sh
 ./rm-display-receiver --epaper-profile=quality
@@ -59,8 +59,8 @@ damage granularity and defaults to 64. A final `SETTLED` includes dirty area
 accumulated by preceding fast updates, even when its pixels equal the last
 `LATEST` frame; its configured semantic waveform determines whether that
 repaint favors latency or clarity. Fast/Fastest SETTLED remains a final-frame
-barrier but does not itself clean ghosting; periodic, static-fast-debt,
-large-damage, first-frame, manual, and recovery policy decide full cleanup.
+barrier but does not itself clean ghosting; adaptive idle, explicit overrides,
+first-frame, manual, and recovery policy decide full cleanup.
 
 Producers may negotiate connection-scoped profile and refresh controls. The
 refresh control can query/update partial-refresh permission, periodic physical

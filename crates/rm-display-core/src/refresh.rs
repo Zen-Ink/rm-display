@@ -110,10 +110,10 @@ impl RefreshPolicyConfig {
                 latest_video_waveform: Waveform::Fastest,
                 settled_waveform: Waveform::Fast,
                 partial_refresh_enabled: true,
-                cleanup_after_updates: 180,
+                cleanup_after_updates: 0,
                 clean_first_frame: true,
                 large_update_threshold_percent: 0,
-                static_cleanup_after_fast_updates: 8,
+                static_cleanup_after_fast_updates: 0,
                 damage_tile: 64,
             },
             RefreshProfile::Balanced => Self {
@@ -123,10 +123,10 @@ impl RefreshPolicyConfig {
                 latest_video_waveform: Waveform::Fastest,
                 settled_waveform: Waveform::Quality,
                 partial_refresh_enabled: true,
-                cleanup_after_updates: 90,
+                cleanup_after_updates: 0,
                 clean_first_frame: true,
                 large_update_threshold_percent: 0,
-                static_cleanup_after_fast_updates: 6,
+                static_cleanup_after_fast_updates: 0,
                 damage_tile: 64,
             },
             RefreshProfile::Reading => Self {
@@ -136,10 +136,10 @@ impl RefreshPolicyConfig {
                 latest_video_waveform: Waveform::Fast,
                 settled_waveform: Waveform::Quality,
                 partial_refresh_enabled: true,
-                cleanup_after_updates: 45,
+                cleanup_after_updates: 0,
                 clean_first_frame: true,
-                large_update_threshold_percent: 50,
-                static_cleanup_after_fast_updates: 3,
+                large_update_threshold_percent: 0,
+                static_cleanup_after_fast_updates: 0,
                 damage_tile: 64,
             },
             RefreshProfile::Quality => Self {
@@ -149,9 +149,9 @@ impl RefreshPolicyConfig {
                 latest_video_waveform: Waveform::Quality,
                 settled_waveform: Waveform::Quality,
                 partial_refresh_enabled: true,
-                cleanup_after_updates: 20,
+                cleanup_after_updates: 0,
                 clean_first_frame: true,
-                large_update_threshold_percent: 33,
+                large_update_threshold_percent: 0,
                 static_cleanup_after_fast_updates: 0,
                 damage_tile: 64,
             },
@@ -382,18 +382,18 @@ mod tests {
 
     #[test]
     fn profile_presets_match_epaper_tradeoffs() {
-        let realtime = RefreshPolicyConfig::for_profile(RefreshProfile::Realtime);
-        let animate = RefreshPolicyConfig::for_profile(RefreshProfile::Animate);
-        let balanced = RefreshPolicyConfig::for_profile(RefreshProfile::Balanced);
-        let reading = RefreshPolicyConfig::for_profile(RefreshProfile::Reading);
-        let quality = RefreshPolicyConfig::for_profile(RefreshProfile::Quality);
-        assert_eq!(realtime.cleanup_after_updates, 0);
-        assert_eq!(animate.cleanup_after_updates, 180);
-        assert_eq!(balanced.cleanup_after_updates, 90);
-        assert_eq!(reading.cleanup_after_updates, 45);
-        assert_eq!(quality.cleanup_after_updates, 20);
-        assert_eq!(reading.large_update_threshold_percent, 50);
-        assert_eq!(quality.large_update_threshold_percent, 33);
+        for profile in [
+            RefreshProfile::Realtime,
+            RefreshProfile::Animate,
+            RefreshProfile::Balanced,
+            RefreshProfile::Reading,
+            RefreshProfile::Quality,
+        ] {
+            let config = RefreshPolicyConfig::for_profile(profile);
+            assert_eq!(config.cleanup_after_updates, 0);
+            assert_eq!(config.large_update_threshold_percent, 0);
+            assert_eq!(config.static_cleanup_after_fast_updates, 0);
+        }
     }
 
     #[test]
@@ -483,22 +483,23 @@ mod tests {
         let switched = config.switched_to(RefreshProfile::Quality);
         assert_eq!(switched.profile, RefreshProfile::Quality);
         assert_eq!(switched.cleanup_after_updates, 7);
-        assert_eq!(switched.large_update_threshold_percent, 33);
+        assert_eq!(switched.large_update_threshold_percent, 0);
         assert_eq!(switched.damage_tile, 32);
 
         let preset = RefreshPolicyConfig::for_profile(RefreshProfile::Balanced)
             .switched_to(RefreshProfile::Reading);
-        assert_eq!(preset.cleanup_after_updates, 45);
-        assert_eq!(preset.large_update_threshold_percent, 50);
+        assert_eq!(preset.cleanup_after_updates, 0);
+        assert_eq!(preset.large_update_threshold_percent, 0);
         let realtime = preset.switched_to(RefreshProfile::Realtime);
         assert_eq!(realtime.cleanup_after_updates, 0);
         assert_eq!(realtime.large_update_threshold_percent, 0);
     }
 
     #[test]
-    fn large_update_cleanup_waits_until_settled() {
+    fn explicit_large_update_cleanup_waits_until_settled() {
         let mut config = RefreshPolicyConfig::for_profile(RefreshProfile::Quality);
         config.clean_first_frame = false;
+        config.large_update_threshold_percent = 33;
         let policy = RefreshPolicy::new(config).unwrap();
         let moving = policy.decide(
             FrameIntent::Latest,

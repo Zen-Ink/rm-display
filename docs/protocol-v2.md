@@ -305,7 +305,7 @@ remain remote application actions; `ActionResult` completes every invocation.
 - A fast SETTLED remains an unsupersedable terminal barrier and presents the
   final pixels, but it is not a ghost-cleanup promise. Full-panel cleanup is a
 separate receiver decision driven by first-frame, periodic, large-damage,
-static-fast-debt, Realtime adaptive-idle, explicit/profile, partial-disabled,
+static-fast-debt, named-profile adaptive-idle, explicit/profile, partial-disabled,
 or recovery policy.
 - Quill/native state is owned by one panel actor. A successful submit advances
   `presented_frame_id`; a zero-damage frame may also advance it without a

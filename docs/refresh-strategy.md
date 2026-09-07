@@ -61,8 +61,8 @@ that region with its selected settled waveform even if its pixels already
 equal the latest software surface. After that successful repaint, the
 motion-local fast debt is cleared. A fast SETTLED still guarantees that the
 exact final frame reaches a terminal result; it deliberately does not promise
-ghost removal. Periodic, static-fast-debt, large-damage, first-frame, explicit,
-and recovery policy own full-panel cleanup.
+ghost removal. Adaptive idle, explicit overrides, first-frame, manual, and
+recovery policy own full-panel cleanup.
 
 If composed pixels are already physically equivalent and there is no fast
 settle region, the receiver completes the frame logically without calling
@@ -70,23 +70,25 @@ Quill. Zero-damage frames do not accrue cleanup debt.
 
 ## Waveform presets
 
-| Profile | LATEST text | LATEST photo | LATEST video | SETTLED | periodic | large area | static fast debt |
-| --- | --- | --- | --- | --- | ---: | ---: | ---: |
-| Realtime | Fastest | Fastest | Fastest | Fastest | adaptive idle | off | off |
-| Animate | Fastest | Quality | Fastest | Fast | 180 | off | 8 |
-| Balanced | Fast | Quality | Fastest | Quality | 90 | off | 6 |
-| Reading | Quality | Quality | Fast | Quality | 45 | 50% | 3 |
-| Quality | Quality | Quality | Quality | Quality | 20 | 33% | off |
+| Profile | LATEST text | LATEST photo | LATEST video | SETTLED | adaptive cleanup |
+| --- | --- | --- | --- | --- | --- |
+| Realtime | Fastest | Fastest | Fastest | Fastest | 8 screens, 10 s idle |
+| Animate | Fastest | Quality | Fastest | Fast | 6 screens, 8 s idle |
+| Balanced | Fast | Quality | Fastest | Quality | 4 screens, 6 s idle |
+| Reading | Quality | Quality | Fast | Quality | 3 screens, 5 s idle |
+| Quality | Quality | Quality | Quality | Quality | 2 screens, 4 s idle |
 
 Fastest, Fast, Quality, and FullQuality map to current Quill mode values 0, 1,
 3, and 4. For a complete refresh, the Quality profile uses FullQuality; other
 named profiles and Custom use Quality plus the complete-refresh flag.
 
-Realtime cleanup is receiver-local: remote frames and overlays
-all contribute their successfully submitted partial damage. After at least
-eight panel-equivalents, it waits for ten seconds with no pen or pending frame
-before one complete cleanup. It is intentionally not a producer-side counter
-and does not change the wire protocol.
+Named-profile cleanup is receiver-local: remote frames and overlays contribute
+their successfully submitted partial damage. Each profile
+uses the table's distinct panel-equivalent budget and then waits for its idle
+period with no pending frame before one complete cleanup. Named presets
+disable periodic, large-area, and static-fast-debt triggers by default; explicit
+online overrides and CUSTOM retain those controls. This does not change the
+wire protocol.
 
 Protocol v2.2 CUSTOM supplies all four semantic waveform columns,
 partial-refresh permission, all three automatic cleanup parameters,
@@ -105,12 +107,14 @@ The receiver reports the selected cause in
    update complete. It does not mean "disable refresh".
 2. `FORCED`: explicit cleanup, five-finger cleanup, profile switch, or recovery
    protection.
-3. `STATIC_FAST_DEBT`: the configured number of Fast/Fastest submissions was
+3. adaptive profile cleanup: the configured named-profile damage budget and
+   idle deadline were reached.
+4. `STATIC_FAST_DEBT`: the explicitly configured number of Fast/Fastest submissions was
    reached during one motion episode and the source has now sent `SETTLED`.
-4. `FIRST_FRAME`: the profile requests a clean initial physical presentation.
-5. `PERIODIC`: successful partial submissions reached
+5. `FIRST_FRAME`: the profile requests a clean initial physical presentation.
+6. `PERIODIC`: successful partial submissions reached
    `cleanup_after_updates`.
-6. `LARGE_DAMAGE`: at `SETTLED`, the unique damaged tiles reached
+7. `LARGE_DAMAGE`: at `SETTLED`, the unique damaged tiles reached
    `large_update_threshold_percent`.
 
 `cleanup_after_updates=0`, `large_update_threshold_percent=0`, and

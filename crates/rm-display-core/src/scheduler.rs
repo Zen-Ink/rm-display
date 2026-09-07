@@ -7,11 +7,14 @@ use crate::surface::tile_damage_regions;
 use crate::{
     tile_damage, FullRefreshReason, GraySurface, LocalOverlay, PanelBackend, PanelError,
     RefreshConfigError, RefreshDebt, RefreshDecision, RefreshPolicy, RefreshPolicyConfig,
-    SurfaceError, Waveform,
+    RefreshProfile, SurfaceError, Waveform,
 };
 
-const REALTIME_CLEANUP_IDLE: Duration = Duration::from_secs(10);
-const REALTIME_CLEANUP_SCREEN_EQUIVALENTS: u64 = 8;
+const REALTIME_CLEANUP: (u64, Duration) = (8, Duration::from_secs(10));
+const ANIMATE_CLEANUP: (u64, Duration) = (6, Duration::from_secs(8));
+const BALANCED_CLEANUP: (u64, Duration) = (4, Duration::from_secs(6));
+const READING_CLEANUP: (u64, Duration) = (3, Duration::from_secs(5));
+const QUALITY_CLEANUP: (u64, Duration) = (2, Duration::from_secs(4));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PresentationOutcome {
@@ -261,16 +264,25 @@ impl DisplayCore {
         }
     }
 
-    fn realtime_cleanup_due(&self, now: Duration) -> bool {
-        self.refresh_policy.config().profile == crate::RefreshProfile::Realtime
-            && self.presented_frame_id != 0
+    fn adaptive_cleanup_due(&self, now: Duration) -> bool {
+        let Some((screen_equivalents, idle)) = (match self.refresh_policy.config().profile {
+            RefreshProfile::Realtime => Some(REALTIME_CLEANUP),
+            RefreshProfile::Animate => Some(ANIMATE_CLEANUP),
+            RefreshProfile::Balanced => Some(BALANCED_CLEANUP),
+            RefreshProfile::Reading => Some(READING_CLEANUP),
+            RefreshProfile::Quality => Some(QUALITY_CLEANUP),
+            RefreshProfile::Custom => None,
+        }) else {
+            return false;
+        };
+        self.presented_frame_id != 0
             && self.partial_damage_pixels_since_cleanup
                 >= u64::from(self.width())
                     .saturating_mul(u64::from(self.height()))
-                    .saturating_mul(REALTIME_CLEANUP_SCREEN_EQUIVALENTS)
+                    .saturating_mul(screen_equivalents)
             && self
                 .last_partial_at
-                .is_some_and(|last| now.saturating_sub(last) >= REALTIME_CLEANUP_IDLE)
+                .is_some_and(|last| now.saturating_sub(last) >= idle)
     }
 
     pub fn update_refresh_config(
@@ -554,7 +566,7 @@ impl DisplayCore {
         now: Duration,
         panel: &mut dyn PanelBackend,
     ) -> Result<Vec<TerminalFrame>, CoreError> {
-        if self.pending.is_none() && self.realtime_cleanup_due(now) {
+        if self.pending.is_none() && self.adaptive_cleanup_due(now) {
             return Ok(self.request_cleanup(now, panel)?.terminals);
         }
         self.tick_inner(now, panel, false)
@@ -1275,53 +1287,47 @@ mod tests {
     }
 
     #[test]
-    fn realtime_cleanup_uses_actual_damage_and_an_idle_deadline() {
-        let config = RefreshPolicyConfig {
-            damage_tile: 2,
-            ..RefreshPolicyConfig::for_profile(RefreshProfile::Realtime)
-        };
-        let mut core = DisplayCore::new(2, 2, 400, Duration::from_millis(200), config).unwrap();
-        let mut panel = MockPanel::new(2, 2);
+    fn named_profiles_use_distinct_damage_and_idle_cleanup_budgets() {
+        for (profile, screen_equivalents, idle) in [
+            (RefreshProfile::Realtime, 8, Duration::from_secs(10)),
+            (RefreshProfile::Animate, 6, Duration::from_secs(8)),
+            (RefreshProfile::Balanced, 4, Duration::from_secs(6)),
+            (RefreshProfile::Reading, 3, Duration::from_secs(5)),
+            (RefreshProfile::Quality, 2, Duration::from_secs(4)),
+        ] {
+            let config = RefreshPolicyConfig {
+                clean_first_frame: false,
+                damage_tile: 2,
+                ..RefreshPolicyConfig::for_profile(profile)
+            };
+            let mut core = DisplayCore::new(2, 2, 400, Duration::from_millis(200), config).unwrap();
+            let mut panel = MockPanel::new(2, 2);
 
-        core.commit(
-            &frame(1, 0, FrameIntent::Latest, vec![1; 4]),
-            ContentClass::TextUi,
-            Duration::ZERO,
-        )
-        .unwrap();
-        core.tick(Duration::ZERO, &mut panel).unwrap();
-        core.commit(
-            &frame(2, 1, FrameIntent::Latest, vec![2; 4]),
-            ContentClass::TextUi,
-            Duration::from_millis(250),
-        )
-        .unwrap();
-        core.tick(Duration::from_millis(250), &mut panel).unwrap();
+            for frame_id in 1..=screen_equivalents {
+                let now = Duration::from_millis((frame_id - 1) * 250);
+                core.commit(
+                    &frame(
+                        frame_id,
+                        frame_id.saturating_sub(1),
+                        FrameIntent::Latest,
+                        vec![frame_id as u8; 4],
+                    ),
+                    ContentClass::TextUi,
+                    now,
+                )
+                .unwrap();
+                core.tick(now, &mut panel).unwrap();
+            }
 
-        for frame_id in 3..=8 {
-            let now = Duration::from_millis(frame_id * 250);
-            core.commit(
-                &frame(
-                    frame_id,
-                    frame_id - 1,
-                    FrameIntent::Latest,
-                    vec![frame_id as u8; 4],
-                ),
-                ContentClass::TextUi,
-                now,
-            )
-            .unwrap();
-            core.tick(now, &mut panel).unwrap();
+            let last_partial = Duration::from_millis((screen_equivalents - 1) * 250);
+            core.tick(last_partial + idle - Duration::from_millis(1), &mut panel)
+                .unwrap();
+            assert_eq!(panel.submissions().len(), screen_equivalents as usize);
+            core.tick(last_partial + idle, &mut panel).unwrap();
+            assert_eq!(panel.submissions().len(), screen_equivalents as usize + 1);
+            assert!(panel.submissions().last().unwrap().refresh.complete_refresh);
+            assert_eq!(core.partial_damage_pixels_since_cleanup, 0);
         }
-
-        core.tick(Duration::from_millis(11_999), &mut panel)
-            .unwrap();
-        assert_eq!(panel.submissions().len(), 8);
-        core.tick(Duration::from_millis(12_000), &mut panel)
-            .unwrap();
-        assert_eq!(panel.submissions().len(), 9);
-        assert!(panel.submissions()[8].refresh.complete_refresh);
-        assert_eq!(core.partial_damage_pixels_since_cleanup, 0);
     }
 
     #[test]

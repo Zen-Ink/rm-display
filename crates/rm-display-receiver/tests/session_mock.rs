@@ -635,7 +635,7 @@ fn negotiated_profile_switch_flushes_pending_settled_and_reports_effective_polic
         result.active.as_ref().unwrap().profile,
         EpaperProfile::Quality as i32
     );
-    assert_eq!(result.active.as_ref().unwrap().cleanup_after_updates, 20);
+    assert_eq!(result.active.as_ref().unwrap().cleanup_after_updates, 0);
     assert!(result.cleanup_performed);
     assert!(!result.cleanup_pending);
     drop(session);
@@ -736,8 +736,8 @@ fn appended_realtime_and_reading_profiles_map_to_effective_presets() {
         Some(Body::EpaperProfileResult(result))
             if result.active.as_ref().is_some_and(|state|
                 state.profile == EpaperProfile::Reading as i32
-                    && state.cleanup_after_updates == 45
-                    && state.large_update_threshold_percent == 50)
+                    && state.cleanup_after_updates == 0
+                    && state.large_update_threshold_percent == 0)
     ));
 }
 

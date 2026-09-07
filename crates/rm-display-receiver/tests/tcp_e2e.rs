@@ -118,8 +118,8 @@ fn exchange<T: Read + Write>(mut stream: T) {
                 && result.cleanup_pending
                 && result.active.as_ref().is_some_and(|state| {
                     state.profile == EpaperProfile::Reading as i32
-                        && state.cleanup_after_updates == 45
-                        && state.large_update_threshold_percent == 50
+                        && state.cleanup_after_updates == 0
+                        && state.large_update_threshold_percent == 0
                 })
     ));
 
