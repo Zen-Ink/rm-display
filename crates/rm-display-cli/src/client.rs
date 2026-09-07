@@ -20,6 +20,7 @@ use crate::events::write_event_jsonl;
 const MIN_MINOR: u32 = 0;
 const MAX_MINOR: u32 = 2;
 const SURFACE_ID: u32 = 1;
+const MAX_DELTA_REGIONS: usize = 64;
 
 pub trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
@@ -508,10 +509,41 @@ impl ProducerClient {
             .result)
     }
 
+    pub fn send_delta_frame(
+        &mut self,
+        surface: &Surface,
+        previous: &[u8],
+        pixels: &[u8],
+        tile: u32,
+        intent: FrameIntent,
+        content_class: ContentClass,
+    ) -> Result<FrameResult, ProducerError> {
+        Ok(self
+            .send_frame_report_inner(
+                surface,
+                pixels,
+                Some((previous, tile)),
+                intent,
+                content_class,
+            )?
+            .result)
+    }
+
     pub fn send_frame_report(
         &mut self,
         surface: &Surface,
         pixels: &[u8],
+        intent: FrameIntent,
+        content_class: ContentClass,
+    ) -> Result<FrameReport, ProducerError> {
+        self.send_frame_report_inner(surface, pixels, None, intent, content_class)
+    }
+
+    fn send_frame_report_inner(
+        &mut self,
+        surface: &Surface,
+        pixels: &[u8],
+        delta: Option<(&[u8], u32)>,
         intent: FrameIntent,
         content_class: ContentClass,
     ) -> Result<FrameReport, ProducerError> {
@@ -535,12 +567,57 @@ impl ProducerClient {
                 limit: surface.max_frame_bytes,
             });
         }
+        if let Some((previous, _)) = delta {
+            if previous.len() != expected {
+                return Err(ProducerError::BadPixelLength {
+                    actual: previous.len(),
+                    expected,
+                });
+            }
+        }
         let mut force_keyframe = self.logical_frame_id == 0;
         loop {
+            let regions = if force_keyframe {
+                vec![encode_region(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: surface.width,
+                        height: surface.height,
+                    },
+                    pixels,
+                    self.zstd_enabled,
+                )]
+            } else if let Some((previous, tile)) = delta {
+                encode_delta_regions(
+                    previous,
+                    pixels,
+                    surface.width,
+                    surface.height,
+                    tile,
+                    (surface.max_regions as usize).min(MAX_DELTA_REGIONS),
+                    self.zstd_enabled,
+                )
+            } else {
+                vec![encode_region(
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: surface.width,
+                        height: surface.height,
+                    },
+                    pixels,
+                    self.zstd_enabled,
+                )]
+            };
+            let decoded_bytes = regions
+                .iter()
+                .map(|region| u64::from(region.decoded_len))
+                .sum::<u64>();
             if self.credits == 0 {
                 return Err(ProducerError::NoCredit);
             }
-            if pixels.len() as u64 > self.byte_credits {
+            if decoded_bytes > self.byte_credits {
                 return Err(ProducerError::NoCredit);
             }
             let frame_id = self.next_frame_id;
@@ -565,22 +642,13 @@ impl ProducerClient {
                 base_frame_id,
                 intent: intent as i32,
                 content_class: content_class as i32,
-                regions: vec![encode_region(
-                    Rect {
-                        x: 0,
-                        y: 0,
-                        width: surface.width,
-                        height: surface.height,
-                    },
-                    pixels,
-                    self.zstd_enabled,
-                )],
+                regions,
                 source_timestamp_us: 0,
             };
             producer.build_us = producer.build_us.saturating_add(elapsed_us(build_started));
             producer.attempts = producer.attempts.saturating_add(1);
             self.credits -= 1;
-            self.byte_credits = self.byte_credits.saturating_sub(pixels.len() as u64);
+            self.byte_credits = self.byte_credits.saturating_sub(decoded_bytes);
             let sent = self.send_measured(envelope::Body::Frame(frame))?;
             producer.wire_encode_us = producer.wire_encode_us.saturating_add(sent.wire_encode_us);
             producer.write_us = producer.write_us.saturating_add(sent.write_us);
@@ -755,6 +823,94 @@ impl ProducerClient {
         self.last_received_id = envelope.message_id;
         Ok(envelope)
     }
+}
+
+fn encode_delta_regions(
+    previous: &[u8],
+    current: &[u8],
+    width: u32,
+    height: u32,
+    tile: u32,
+    max_regions: usize,
+    allow_zstd: bool,
+) -> Vec<rm_display_protocol::FrameRegion> {
+    let tile = tile.max(1) as usize;
+    let width = width as usize;
+    let height = height as usize;
+    let mut rects: Vec<Rect> = Vec::new();
+    for y in (0..height).step_by(tile) {
+        let rect_height = tile.min(height - y);
+        let mut x = 0;
+        while x < width {
+            let changed = |tile_x: usize| {
+                let rect_width = tile.min(width - tile_x);
+                (0..rect_height).any(|row| {
+                    let start = (y + row) * width + tile_x;
+                    previous[start..start + rect_width] != current[start..start + rect_width]
+                })
+            };
+            if !changed(x) {
+                x += tile;
+                continue;
+            }
+            let start = x;
+            x += tile;
+            while x < width && changed(x) {
+                x += tile;
+            }
+            let run_width = x.min(width) - start;
+            if let Some(rect) = rects.iter_mut().rev().find(|rect| {
+                rect.x == start as u32
+                    && rect.width == run_width as u32
+                    && rect.y + rect.height == y as u32
+            }) {
+                rect.height += rect_height as u32;
+            } else {
+                rects.push(Rect {
+                    x: start as u32,
+                    y: y as u32,
+                    width: run_width as u32,
+                    height: rect_height as u32,
+                });
+            }
+        }
+    }
+    if rects.len() > max_regions.max(1) {
+        let left = rects.iter().map(|rect| rect.x).min().unwrap();
+        let top = rects.iter().map(|rect| rect.y).min().unwrap();
+        let right = rects.iter().map(|rect| rect.x + rect.width).max().unwrap();
+        let bottom = rects.iter().map(|rect| rect.y + rect.height).max().unwrap();
+        rects = vec![Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        }];
+    }
+    if rects.is_empty() {
+        rects.push(Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+        });
+    }
+    rects
+        .into_iter()
+        .map(|rect| {
+            let pixels = extract_region(current, width, &rect);
+            encode_region(rect, &pixels, allow_zstd)
+        })
+        .collect()
+}
+
+fn extract_region(pixels: &[u8], surface_width: usize, rect: &Rect) -> Vec<u8> {
+    let mut output = Vec::with_capacity(rect.width as usize * rect.height as usize);
+    for row in rect.y as usize..(rect.y + rect.height) as usize {
+        let start = row * surface_width + rect.x as usize;
+        output.extend_from_slice(&pixels[start..start + rect.width as usize]);
+    }
+    output
 }
 
 fn encode_region(rect: Rect, pixels: &[u8], allow_zstd: bool) -> rm_display_protocol::FrameRegion {
@@ -1003,9 +1159,11 @@ mod tests {
             )
             .unwrap();
         client
-            .send_frame(
+            .send_delta_frame(
                 &surface,
-                &[4, 5, 6, 7],
+                &[0, 1, 2, 3],
+                &[0, 1, 2, 7],
+                1,
                 FrameIntent::Settled,
                 ContentClass::TextUi,
             )
@@ -1022,8 +1180,40 @@ mod tests {
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].base_frame_id, 0);
         assert_eq!(frames[1].base_frame_id, 1);
+        assert_eq!(frames[1].regions.len(), 1);
+        assert_eq!(
+            frames[1].regions[0].rect,
+            Some(Rect {
+                x: 1,
+                y: 1,
+                width: 1,
+                height: 1,
+            })
+        );
+        assert_eq!(frames[1].regions[0].data.as_ref(), [7]);
         assert_eq!(frames[2].base_frame_id, 0);
+        assert_eq!(frames[2].regions[0].data.as_ref(), [0, 1, 2, 7]);
         assert_eq!(frames[2].intent, FrameIntent::Settled as i32);
+    }
+
+    #[test]
+    fn delta_regions_merge_tiles_and_respect_the_region_limit() {
+        let previous = [0; 16];
+        let current = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let regions = encode_delta_regions(&previous, &current, 4, 4, 2, 8, false);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].rect.as_ref().unwrap().x, 0);
+        assert_eq!(regions[0].data.as_ref(), [1, 0, 0, 0]);
+        assert_eq!(regions[1].rect.as_ref().unwrap().x, 2);
+        assert_eq!(regions[1].data.as_ref(), [0, 0, 0, 2]);
+
+        let bounded = encode_delta_regions(&previous, &current, 4, 4, 2, 1, false);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].decoded_len, 16);
+
+        let unchanged = encode_delta_regions(&previous, &previous, 4, 4, 2, 8, false);
+        assert_eq!(unchanged.len(), 1);
+        assert_eq!(unchanged[0].decoded_len, 1);
     }
 
     #[test]
