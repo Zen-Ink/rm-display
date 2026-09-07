@@ -115,9 +115,9 @@ pub struct DisplayCore {
     /// across frame superseding and backend failure until a complete refresh
     /// has actually succeeded.
     force_cleanup_next: bool,
-    /// Tile-exact damage refreshed with a fast waveform since the last settled
-    /// or complete presentation. A SETTLED frame must repaint these tiles with
-    /// a quality waveform even when their pixels equal the latest frame.
+    /// Tile-exact damage refreshed with a fast waveform since the last quality
+    /// or complete presentation. A quality SETTLED frame repaints these tiles
+    /// even when their pixels equal the latest frame.
     settle_damage: Vec<Rect>,
     fast_updates_since_settled: u32,
 }
@@ -284,17 +284,31 @@ impl DisplayCore {
         let damage =
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);
-        panel.submit(&composed, &damage, decision)?;
+        let panel_metrics = panel.submit(&composed, &damage, decision)?;
         self.presented = composed;
         self.working.clone_from(&self.presented);
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
-        self.refresh_policy.presented(decision);
+        self.refresh_policy
+            .presented_submissions(decision, panel_metrics.physical_submissions);
         if decision.complete_refresh {
             self.force_cleanup_next = false;
         }
-        self.settle_damage.clear();
-        self.fast_updates_since_settled = 0;
+        if decision.complete_refresh || decision.waveform != Waveform::Fastest {
+            self.settle_damage.clear();
+            self.fast_updates_since_settled = 0;
+        } else {
+            self.settle_damage = merge_tiled_damage(
+                self.width(),
+                self.height(),
+                self.damage_tile,
+                &self.settle_damage,
+                &damage,
+            );
+            self.fast_updates_since_settled = self
+                .fast_updates_since_settled
+                .saturating_add(panel_metrics.physical_submissions);
+        }
         Ok(terminals)
     }
 
@@ -558,7 +572,7 @@ impl DisplayCore {
         }
         self.base
             .compose_regions_into(&self.overlay, &mut self.working, &compose_regions)?;
-        let mut damage = if pending.force_full_damage {
+        let damage = if pending.force_full_damage {
             full_damage(self.width(), self.height())
         } else {
             tile_damage_regions(
@@ -568,15 +582,17 @@ impl DisplayCore {
                 &compose_regions,
             )
         };
-        if pending.intent == FrameIntent::Settled {
-            damage = merge_tiled_damage(
+        let decision_damage = if pending.intent == FrameIntent::Settled {
+            merge_tiled_damage(
                 self.width(),
                 self.height(),
                 self.damage_tile,
                 &self.settle_damage,
                 &damage,
-            );
-        }
+            )
+        } else {
+            damage.clone()
+        };
         let force_cleanup = pending.force_cleanup || self.force_cleanup_next;
         let static_cleanup_due = !force_cleanup
             && pending.intent == FrameIntent::Settled
@@ -594,13 +610,21 @@ impl DisplayCore {
         let mut decision = self.refresh_policy.decide(
             pending.intent,
             pending.content_class,
-            damage_pixels(&damage),
+            damage_pixels(&decision_damage),
             u64::from(self.width()) * u64::from(self.height()),
             force_cleanup || static_cleanup_due,
         );
         if static_cleanup_due && decision.full_refresh_reason == FullRefreshReason::Forced {
             decision.full_refresh_reason = FullRefreshReason::StaticFastDebt;
         }
+        // A Fastest SETTLED frame is only an ordering barrier. Do
+        // not repaint historical fast tiles with the same fast waveform.
+        let damage =
+            if pending.intent == FrameIntent::Settled && decision.waveform != Waveform::Fastest {
+                decision_damage
+            } else {
+                damage
+            };
         let mut damage =
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);
@@ -665,7 +689,9 @@ impl DisplayCore {
         self.panel_state_uncertain = false;
         self.refresh_policy
             .presented_submissions(decision, panel_metrics.physical_submissions);
-        if decision.complete_refresh || pending.intent == FrameIntent::Settled {
+        if decision.complete_refresh
+            || pending.intent == FrameIntent::Settled && decision.waveform != Waveform::Fastest
+        {
             self.settle_damage.clear();
             self.fast_updates_since_settled = 0;
         } else if matches!(decision.waveform, Waveform::Fastest | Waveform::Fast) {
@@ -1160,6 +1186,39 @@ mod tests {
         assert_eq!(terminal[0].metrics.damage_pixels, 0);
         assert_eq!(panel.submissions().len(), 3);
         assert_eq!(core.presented_frame_id(), 4);
+    }
+
+    #[test]
+    fn fastest_settled_is_a_barrier_without_repainting_fast_damage() {
+        let config = RefreshPolicyConfig {
+            settled_waveform: Waveform::Fastest,
+            clean_first_frame: false,
+            damage_tile: 2,
+            ..RefreshPolicyConfig::default()
+        };
+        let mut core = DisplayCore::new(2, 2, 400, Duration::from_millis(200), config).unwrap();
+        let mut panel = MockPanel::new(2, 2);
+
+        core.commit(
+            &frame(1, 0, FrameIntent::Latest, vec![1; 4]),
+            ContentClass::TextUi,
+            Duration::ZERO,
+        )
+        .unwrap();
+        core.tick(Duration::ZERO, &mut panel).unwrap();
+        assert_eq!(panel.submissions().len(), 1);
+        assert_eq!(core.fast_updates_since_settled(), 1);
+
+        core.commit(
+            &frame(2, 1, FrameIntent::Settled, vec![1; 4]),
+            ContentClass::TextUi,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let terminal = core.tick(Duration::from_millis(210), &mut panel).unwrap();
+        assert_eq!(terminal[0].metrics.damage_pixels, 0);
+        assert_eq!(panel.submissions().len(), 1);
+        assert_eq!(core.fast_updates_since_settled(), 1);
     }
 
     #[test]
