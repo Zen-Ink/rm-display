@@ -17,6 +17,8 @@ pub struct PanelInfo {
 pub struct PanelSubmissionMetrics {
     pub convert_us: u32,
     pub submit_us: u32,
+    /// Number of physical partial/full updates accepted by the backend.
+    pub physical_submissions: u32,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -138,7 +140,10 @@ impl PanelBackend for MockPanel {
             damage: damage.to_vec(),
             refresh,
         });
-        Ok(PanelSubmissionMetrics::default())
+        Ok(PanelSubmissionMetrics {
+            physical_submissions: 1,
+            ..PanelSubmissionMetrics::default()
+        })
     }
 
     fn pump(&mut self) -> Result<(), PanelError> {

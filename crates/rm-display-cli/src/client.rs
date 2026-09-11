@@ -581,7 +581,6 @@ impl ProducerClient {
                 .map(Some);
         }
         validate_frame_pixels(surface, pixels, Some(previous))?;
-        let started = Instant::now();
         let build_started = Instant::now();
         let regions = encode_delta_regions(
             previous,
@@ -643,7 +642,7 @@ impl ProducerClient {
         self.logical_frame_id = frame_id;
         self.pending_frames.push_back(PendingFrame {
             frame_id,
-            started,
+            started: Instant::now(),
             producer,
         });
         Ok(completed)
@@ -664,6 +663,11 @@ impl ProducerClient {
 
     pub fn pending_frame_count(&self) -> usize {
         self.pending_frames.len()
+    }
+
+    /// Most recent frame sent by this producer, including a speculative tail.
+    pub fn latest_frame_id(&self) -> u64 {
+        self.logical_frame_id
     }
 
     pub fn send_frame_report(
@@ -873,7 +877,12 @@ impl ProducerClient {
             .producer
             .wait_us
             .saturating_add(elapsed_us(pending.started));
-        pending.producer.total_us = pending.producer.wait_us;
+        pending.producer.total_us = pending
+            .producer
+            .build_us
+            .saturating_add(pending.producer.wire_encode_us)
+            .saturating_add(pending.producer.write_us)
+            .saturating_add(pending.producer.wait_us);
         Ok(FrameReport {
             result,
             producer: pending.producer,
@@ -1474,6 +1483,7 @@ mod tests {
                 .is_none());
         }
         assert_eq!(client.pending_frame_count(), 2);
+        assert_eq!(client.latest_frame_id(), 3);
         let report = client.wait_for_frame_credit_report().unwrap().unwrap();
         assert_eq!(report.result.frame_id, 2);
         assert_eq!(client.pending_frame_count(), 1);

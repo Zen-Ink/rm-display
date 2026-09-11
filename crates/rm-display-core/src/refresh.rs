@@ -311,11 +311,16 @@ impl RefreshPolicy {
     /// Record one successful physical panel submission. Zero-damage logical
     /// presentations do not accrue cleanup debt because no ink was updated.
     pub fn presented(&mut self, decision: RefreshDecision) {
+        self.presented_submissions(decision, 1);
+    }
+
+    pub fn presented_submissions(&mut self, decision: RefreshDecision, physical_submissions: u32) {
         self.has_presented = true;
         self.presented_since_cleanup = if decision.complete_refresh {
             0
         } else {
-            self.presented_since_cleanup.saturating_add(1)
+            self.presented_since_cleanup
+                .saturating_add(physical_submissions)
         };
     }
 
@@ -609,6 +614,20 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, RefreshConfigError::DebtWithoutPresentation);
         assert_eq!(policy.debt(), RefreshDebt::default());
+    }
+
+    #[test]
+    fn refresh_debt_counts_backend_physical_submissions() {
+        let mut policy = RefreshPolicy::new(RefreshPolicyConfig::default()).unwrap();
+        policy.presented_submissions(
+            RefreshDecision {
+                waveform: Waveform::Fastest,
+                complete_refresh: false,
+                full_refresh_reason: FullRefreshReason::None,
+            },
+            14,
+        );
+        assert_eq!(policy.presented_since_cleanup(), 14);
     }
 
     #[test]

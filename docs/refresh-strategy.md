@@ -12,7 +12,7 @@ diagnosing an unexpected partial or complete refresh.
   `content_class` per frame. A negotiated v2.2 Custom profile may carry stable
   semantic waveform policy, but never a native Quill mode or partial/full flag.
 - The receiver computes pixel damage, chooses waveform and partial/complete
-  update, tracks ghost-cleanup debt, and submits one union rectangle to Quill.
+  update, tracks ghost-cleanup debt, and submits one sparse QRegion to Quill.
 - Quill receives `mode`, `complete_refresh`, and `is_color` from the receiver.
   A producer cannot call or configure the vendor API directly.
 
@@ -45,8 +45,9 @@ frame rules.
 
 The receiver composites the remote base and local overlay, compares the result
 against the last physically presented surface in 64-pixel tiles, and submits
-only changed damage. Multiple rectangles are reduced to the bounding union at
-the current Quill C ABI.
+only changed damage. Sparse Fastest damage is clustered and sent through one
+vendor QRegion transaction; dense, quality, and complete updates use one
+bounding rectangle. Either path counts as one physical submission.
 
 When `partial_refresh_enabled=true` and no complete-refresh trigger is active,
 the update remains partial. A `SETTLED` frame is still partial; its waveform is

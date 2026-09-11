@@ -1,7 +1,6 @@
 //! Single-threaded Quill/libqsgepaper panel backend.
 
 use std::marker::PhantomData;
-use std::os::raw::c_ulong;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
@@ -23,17 +22,26 @@ unsafe extern "C" {
     fn quill_format() -> i32;
     fn quill_buffer() -> *mut u8;
     fn quill_capabilities() -> u32;
-    fn quill_swap_ex(
-        x: i32,
-        y: i32,
-        width: i32,
-        height: i32,
+    fn quill_swap_many_ex(
+        rects: *const QuillRect,
+        count: usize,
         mode: i32,
         full: i32,
         color: i32,
-    ) -> c_ulong;
+    ) -> i32;
     fn quill_process_events();
 }
+
+#[repr(C)]
+struct QuillRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+const MAX_BATCH_REGIONS: usize = 32;
+const SPARSE_SWAP_COST_PIXELS: u64 = 8_192;
 
 pub struct QuillPanel {
     info: PanelInfo,
@@ -41,6 +49,7 @@ pub struct QuillPanel {
     format: NativePixelFormat,
     buffer: NonNull<u8>,
     buffer_len: usize,
+    last_timing_log: Option<Instant>,
     color_capable: bool,
     _single_thread: PhantomData<Rc<()>>,
 }
@@ -109,6 +118,7 @@ impl QuillPanel {
             format,
             buffer,
             buffer_len,
+            last_timing_log: None,
             color_capable,
             _single_thread: PhantomData,
         })
@@ -150,9 +160,26 @@ impl PanelBackend for QuillPanel {
             damage,
         )?;
         let convert_us = duration_us(convert_started.elapsed());
+        let submit_started = Instant::now();
         let union =
             union_damage(damage).ok_or_else(|| PanelError::Submit("empty damage".into()))?;
-        let submit_started = Instant::now();
+        let damage_pixels = rect_pixels(damage);
+        let union_pixels = rect_pixels(std::slice::from_ref(&union));
+        let clustered_damage = cluster_damage(damage, MAX_BATCH_REGIONS);
+        let clustered_pixels = rect_pixels(&clustered_damage);
+        let sparse = use_sparse_damage(
+            clustered_damage.len(),
+            clustered_pixels,
+            union_pixels,
+            refresh.waveform,
+            refresh.complete_refresh,
+        );
+        let submit_damage = if sparse {
+            clustered_damage.as_slice()
+        } else {
+            std::slice::from_ref(&union)
+        };
+        let submitted_pixels = rect_pixels(submit_damage);
         let mode = if self.color_capable {
             refresh.waveform as i32
         } else {
@@ -161,24 +188,64 @@ impl PanelBackend for QuillPanel {
                 Waveform::Fast | Waveform::Quality | Waveform::FullQuality => 1,
             }
         };
-        let marker = unsafe {
-            quill_swap_ex(
-                union.x as i32,
-                union.y as i32,
-                union.width as i32,
-                union.height as i32,
+        let swap_started = Instant::now();
+        let native_damage = submit_damage
+            .iter()
+            .map(|rect| QuillRect {
+                x: rect.x as i32,
+                y: rect.y as i32,
+                width: rect.width as i32,
+                height: rect.height as i32,
+            })
+            .collect::<Vec<_>>();
+        let accepted = unsafe {
+            quill_swap_many_ex(
+                native_damage.as_ptr(),
+                native_damage.len(),
                 mode,
                 i32::from(refresh.complete_refresh),
                 i32::from(frame.format() == PixelFormat::Rgb565Le),
             )
         };
-        if marker == 0 {
-            return Err(PanelError::Submit("quill_swap_ex returned zero".into()));
+        if accepted != 1 {
+            return Err(PanelError::Submit(format!(
+                "quill_swap_many_ex returned status {accepted}"
+            )));
         }
+        let physical_submissions = 1;
+        let swap_us = duration_us(swap_started.elapsed());
+        let events_started = Instant::now();
         unsafe { quill_process_events() };
+        let events_us = duration_us(events_started.elapsed());
+        let submit_us = duration_us(submit_started.elapsed());
+        let now = Instant::now();
+        if self
+            .last_timing_log
+            .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+        {
+            let inflation = union_pixels as f64 / damage_pixels.max(1) as f64;
+            eprintln!(
+                "rm-display-receiver: Quill timing waveform={:?} full={} status={} regions={} swaps={} damage={}px submitted={}px union={}px inflation={:.2}x framebuffer={:.2}ms swap={:.2}ms events={:.2}ms submit={:.2}ms",
+                refresh.waveform,
+                refresh.complete_refresh,
+                accepted,
+                damage.len(),
+                physical_submissions,
+                damage_pixels,
+                submitted_pixels,
+                union_pixels,
+                inflation,
+                f64::from(convert_us) / 1_000.0,
+                f64::from(swap_us) / 1_000.0,
+                f64::from(events_us) / 1_000.0,
+                f64::from(submit_us) / 1_000.0,
+            );
+            self.last_timing_log = Some(now);
+        }
         Ok(PanelSubmissionMetrics {
             convert_us,
-            submit_us: duration_us(submit_started.elapsed()),
+            submit_us,
+            physical_submissions,
         })
     }
 
@@ -190,6 +257,89 @@ impl PanelBackend for QuillPanel {
 
 fn duration_us(duration: Duration) -> u32 {
     duration.as_micros().min(u128::from(u32::MAX)) as u32
+}
+
+fn rect_pixels(rects: &[Rect]) -> u64 {
+    rects.iter().fold(0, |total, rect| {
+        total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
+    })
+}
+
+fn use_sparse_damage(
+    region_count: usize,
+    submitted_pixels: u64,
+    union_pixels: u64,
+    waveform: Waveform,
+    complete_refresh: bool,
+) -> bool {
+    !complete_refresh
+        && waveform == Waveform::Fastest
+        && region_count >= 2
+        && union_pixels
+            > submitted_pixels
+                .saturating_add((region_count as u64).saturating_mul(SPARSE_SWAP_COST_PIXELS))
+}
+
+fn cluster_damage(rects: &[Rect], limit: usize) -> Vec<Rect> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut sorted = rects.to_vec();
+    sorted.sort_unstable_by_key(|rect| (rect.y, rect.x, rect.height, rect.width));
+
+    let mut clusters: Vec<Rect> = Vec::with_capacity(sorted.len().min(limit));
+    for rect in sorted {
+        if let Some(last) = clusters.last_mut() {
+            let combined = union_pair(last, &rect);
+            if rect_pixels(std::slice::from_ref(&combined))
+                <= rect_pixels(std::slice::from_ref(last))
+                    .saturating_add(rect_pixels(std::slice::from_ref(&rect)))
+            {
+                *last = combined;
+                continue;
+            }
+        }
+        clusters.push(rect);
+    }
+
+    // ponytail: O(n²) adjacent clustering is bounded by the panel tile count;
+    // replace it with a heap only if profiling shows this CPU work matters.
+    while clusters.len() > limit {
+        let (index, combined) = clusters
+            .windows(2)
+            .enumerate()
+            .map(|(index, pair)| {
+                let combined = union_pair(&pair[0], &pair[1]);
+                let added =
+                    rect_pixels(std::slice::from_ref(&combined)).saturating_sub(rect_pixels(pair));
+                (index, combined, added)
+            })
+            .min_by_key(|(_, _, added)| *added)
+            .map(|(index, combined, _)| (index, combined))
+            .expect("more than one cluster");
+        clusters[index] = combined;
+        clusters.remove(index + 1);
+    }
+    clusters
+}
+
+fn union_pair(left: &Rect, right: &Rect) -> Rect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    let far_x = left
+        .x
+        .saturating_add(left.width)
+        .max(right.x.saturating_add(right.width));
+    let far_y = left
+        .y
+        .saturating_add(left.height)
+        .max(right.y.saturating_add(right.height));
+    Rect {
+        x,
+        y,
+        width: far_x - x,
+        height: far_y - y,
+    }
 }
 
 fn union_damage(rects: &[Rect]) -> Option<Rect> {
@@ -208,4 +358,84 @@ fn union_damage(rects: &[Rect]) -> Option<Rect> {
         width: right - left,
         height: bottom - top,
     })
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_submission_avoids_large_fast_union_only() {
+        assert!(use_sparse_damage(
+            15,
+            15_360,
+            466_944,
+            Waveform::Fastest,
+            false
+        ));
+        assert!(!use_sparse_damage(
+            15,
+            15_360,
+            46_000,
+            Waveform::Fastest,
+            false
+        ));
+        assert!(!use_sparse_damage(
+            15,
+            15_360,
+            466_944,
+            Waveform::Quality,
+            false
+        ));
+        assert!(!use_sparse_damage(
+            15,
+            15_360,
+            466_944,
+            Waveform::Fastest,
+            true
+        ));
+        assert!(!use_sparse_damage(
+            1,
+            1_024,
+            100_000,
+            Waveform::Fastest,
+            false
+        ));
+    }
+
+    #[test]
+    fn clustering_has_no_region_count_cliff() {
+        let tiles: Vec<_> = (0..261)
+            .map(|index| Rect {
+                x: (index % 20) * 64,
+                y: (index / 20) * 64,
+                width: 32,
+                height: 32,
+            })
+            .collect();
+        let clusters = cluster_damage(&tiles, MAX_BATCH_REGIONS);
+        assert_eq!(clusters.len(), MAX_BATCH_REGIONS);
+        assert!(use_sparse_damage(
+            clusters.len(),
+            rect_pixels(&tiles),
+            rect_pixels(&[union_damage(&tiles).unwrap()]),
+            Waveform::Fastest,
+            false
+        ));
+
+        let adjacent = [
+            Rect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+            Rect {
+                x: 32,
+                y: 0,
+                width: 32,
+                height: 32,
+            },
+        ];
+        assert_eq!(cluster_damage(&adjacent, MAX_BATCH_REGIONS).len(), 1);
+    }
 }

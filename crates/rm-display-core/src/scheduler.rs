@@ -660,13 +660,16 @@ impl DisplayCore {
         self.presented_frame_id = pending.frame_id;
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
-        self.refresh_policy.presented(decision);
+        self.refresh_policy
+            .presented_submissions(decision, panel_metrics.physical_submissions);
         if decision.complete_refresh || pending.intent == FrameIntent::Settled {
             self.settle_damage = None;
             self.fast_updates_since_settled = 0;
         } else if matches!(decision.waveform, Waveform::Fastest | Waveform::Fast) {
             self.settle_damage = bounding_damage_with(self.settle_damage.as_ref(), &damage);
-            self.fast_updates_since_settled = self.fast_updates_since_settled.saturating_add(1);
+            self.fast_updates_since_settled = self
+                .fast_updates_since_settled
+                .saturating_add(panel_metrics.physical_submissions);
         }
         if decision.complete_refresh {
             self.force_cleanup_next = false;

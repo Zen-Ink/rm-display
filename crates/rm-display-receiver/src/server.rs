@@ -323,6 +323,7 @@ impl ReceiverServer {
     }
 
     fn serve_stream(&mut self, stream: TcpStream) -> Result<(), ServerError> {
+        stream.set_nodelay(true)?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         #[cfg(feature = "tls")]
         if let Some(psk) = &self.psk {
