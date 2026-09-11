@@ -595,7 +595,6 @@ impl ProducerClient {
             .iter()
             .map(|region| u64::from(region.decoded_len))
             .sum::<u64>();
-        let mut completed = None;
         while self.pending_frames.len() >= 2
             || self.credits == 0
             || decoded_bytes > self.byte_credits
@@ -611,7 +610,7 @@ impl ProducerClient {
                     .send_frame_report(surface, pixels, FrameIntent::Latest, content_class)
                     .map(Some);
             }
-            completed = Some(report);
+            self.completed_frame_reports.push_back(report);
         }
         let frame_id = self.next_frame_id;
         self.next_frame_id = self
@@ -645,7 +644,7 @@ impl ProducerClient {
             started: Instant::now(),
             producer,
         });
-        Ok(completed)
+        Ok(self.completed_frame_reports.pop_front())
     }
 
     pub fn wait_for_frame_credit_report(&mut self) -> Result<Option<FrameReport>, ProducerError> {
@@ -1686,6 +1685,89 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(report.result.frame_id, 2);
+        assert_eq!(client.pending_frame_count(), 1);
+    }
+
+    #[test]
+    fn queue_preserves_every_report_when_reaping_multiple_frames() {
+        let mut hello = server_hello();
+        hello.selected_minor = 1;
+        hello.features.push(ProtocolFeature::ByteCredits as i32);
+        hello.limits.as_mut().unwrap().max_inflight = 2;
+        hello.limits.as_mut().unwrap().max_inflight_bytes = 4;
+        let mut surface_ready = ready();
+        surface_ready.limits.as_mut().unwrap().max_inflight = 2;
+        surface_ready.limits.as_mut().unwrap().max_inflight_bytes = 4;
+
+        let mut first = result(1, FrameResultCode::Presented, 1);
+        first.credits = 2;
+        first.byte_credits = 4;
+        let mut second = result(2, FrameResultCode::Presented, 2);
+        second.credits = 1;
+        second.byte_credits = 2;
+        let mut third = result(3, FrameResultCode::Presented, 3);
+        third.credits = 2;
+        third.byte_credits = 4;
+        let responses = framed_responses(vec![
+            envelope::Body::ServerHello(hello),
+            envelope::Body::SurfaceReady(surface_ready),
+            envelope::Body::FrameResult(first),
+            envelope::Body::FrameResult(second),
+            envelope::Body::FrameResult(third),
+        ]);
+        let mut client = ProducerClient::new(
+            Box::new(MockIo {
+                input: Cursor::new(responses),
+                output: Arc::new(Mutex::new(Vec::new())),
+            }),
+            [1; 16],
+        );
+        client.hello("test").unwrap();
+        let surface = client
+            .open_surface(0, 0, SourceKind::LinuxStream, false, "test")
+            .unwrap();
+        client
+            .send_frame_report(
+                &surface,
+                &[0, 0, 0, 0],
+                FrameIntent::Latest,
+                ContentClass::TextUi,
+            )
+            .unwrap();
+        assert!(client
+            .queue_delta_frame_report(
+                &surface,
+                &[0, 0, 0, 0],
+                &[1, 0, 0, 0],
+                1,
+                ContentClass::TextUi,
+            )
+            .unwrap()
+            .is_none());
+        assert!(client
+            .queue_delta_frame_report(
+                &surface,
+                &[1, 0, 0, 0],
+                &[1, 1, 0, 0],
+                1,
+                ContentClass::TextUi,
+            )
+            .unwrap()
+            .is_none());
+
+        let first_report = client
+            .queue_delta_frame_report(
+                &surface,
+                &[1, 1, 0, 0],
+                &[0, 0, 1, 1],
+                1,
+                ContentClass::TextUi,
+            )
+            .unwrap()
+            .unwrap();
+        let second_report = client.wait_for_frame_credit_report().unwrap().unwrap();
+        assert_eq!(first_report.result.frame_id, 2);
+        assert_eq!(second_report.result.frame_id, 3);
         assert_eq!(client.pending_frame_count(), 1);
     }
 
