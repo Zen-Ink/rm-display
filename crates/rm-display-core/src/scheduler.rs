@@ -115,10 +115,10 @@ pub struct DisplayCore {
     /// across frame superseding and backend failure until a complete refresh
     /// has actually succeeded.
     force_cleanup_next: bool,
-    /// Bounding damage refreshed with a fast waveform since the last settled
-    /// or complete presentation. A SETTLED frame must repaint this area with
-    /// a quality waveform even when its pixels equal the latest frame.
-    settle_damage: Option<Rect>,
+    /// Tile-exact damage refreshed with a fast waveform since the last settled
+    /// or complete presentation. A SETTLED frame must repaint these tiles with
+    /// a quality waveform even when their pixels equal the latest frame.
+    settle_damage: Vec<Rect>,
     fast_updates_since_settled: u32,
 }
 
@@ -167,7 +167,7 @@ impl DisplayCore {
             damage_tile: refresh_config.damage_tile,
             panel_state_uncertain: false,
             force_cleanup_next: false,
-            settle_damage: None,
+            settle_damage: Vec::new(),
             fast_updates_since_settled: 0,
         })
     }
@@ -277,7 +277,7 @@ impl DisplayCore {
         let decision = self.refresh_policy.decide(
             FrameIntent::Settled,
             ContentClass::TextUi,
-            bounding_damage_pixels(&damage),
+            damage_pixels(&damage),
             u64::from(self.width()) * u64::from(self.height()),
             false,
         );
@@ -293,7 +293,7 @@ impl DisplayCore {
         if decision.complete_refresh {
             self.force_cleanup_next = false;
         }
-        self.settle_damage = None;
+        self.settle_damage.clear();
         self.fast_updates_since_settled = 0;
         Ok(terminals)
     }
@@ -494,7 +494,7 @@ impl DisplayCore {
         self.panel_state_uncertain = false;
         self.refresh_policy.presented(decision);
         self.force_cleanup_next = false;
-        self.settle_damage = None;
+        self.settle_damage.clear();
         self.fast_updates_since_settled = 0;
         report.cleanup_performed = true;
         report.cleanup_pending = false;
@@ -569,15 +569,18 @@ impl DisplayCore {
             )
         };
         if pending.intent == FrameIntent::Settled {
-            if let Some(debt) = self.settle_damage.as_ref() {
-                damage.push(debt.clone());
-                damage = bounding_damage(&damage).into_iter().collect();
-            }
+            damage = merge_tiled_damage(
+                self.width(),
+                self.height(),
+                self.damage_tile,
+                &self.settle_damage,
+                &damage,
+            );
         }
         let force_cleanup = pending.force_cleanup || self.force_cleanup_next;
         let static_cleanup_due = !force_cleanup
             && pending.intent == FrameIntent::Settled
-            && self.settle_damage.is_some()
+            && !self.settle_damage.is_empty()
             && self
                 .refresh_policy
                 .config()
@@ -591,7 +594,7 @@ impl DisplayCore {
         let mut decision = self.refresh_policy.decide(
             pending.intent,
             pending.content_class,
-            bounding_damage_pixels(&damage),
+            damage_pixels(&damage),
             u64::from(self.width()) * u64::from(self.height()),
             force_cleanup || static_cleanup_due,
         );
@@ -663,10 +666,16 @@ impl DisplayCore {
         self.refresh_policy
             .presented_submissions(decision, panel_metrics.physical_submissions);
         if decision.complete_refresh || pending.intent == FrameIntent::Settled {
-            self.settle_damage = None;
+            self.settle_damage.clear();
             self.fast_updates_since_settled = 0;
         } else if matches!(decision.waveform, Waveform::Fastest | Waveform::Fast) {
-            self.settle_damage = bounding_damage_with(self.settle_damage.as_ref(), &damage);
+            self.settle_damage = merge_tiled_damage(
+                self.width(),
+                self.height(),
+                self.damage_tile,
+                &self.settle_damage,
+                &damage,
+            );
             self.fast_updates_since_settled = self
                 .fast_updates_since_settled
                 .saturating_add(panel_metrics.physical_submissions);
@@ -685,7 +694,7 @@ impl DisplayCore {
         self.base_valid = false;
         self.logical_frame_id = 0;
         self.panel_state_uncertain = true;
-        self.settle_damage = None;
+        self.settle_damage.clear();
         self.fast_updates_since_settled = 0;
     }
 }
@@ -699,34 +708,52 @@ fn full_damage(width: u32, height: u32) -> Vec<Rect> {
     }]
 }
 
-fn bounding_damage_with(existing: Option<&Rect>, damage: &[Rect]) -> Option<Rect> {
-    let mut combined = damage.to_vec();
-    combined.extend(existing.cloned());
-    bounding_damage(&combined)
-}
-
-fn bounding_damage(damage: &[Rect]) -> Option<Rect> {
-    let first = damage.first()?;
-    let mut left = first.x;
-    let mut top = first.y;
-    let mut right = first.x + first.width;
-    let mut bottom = first.y + first.height;
-    for rect in &damage[1..] {
-        left = left.min(rect.x);
-        top = top.min(rect.y);
-        right = right.max(rect.x + rect.width);
-        bottom = bottom.max(rect.y + rect.height);
-    }
-    Some(Rect {
-        x: left,
-        y: top,
-        width: right - left,
-        height: bottom - top,
+fn damage_pixels(damage: &[Rect]) -> u64 {
+    damage.iter().fold(0, |total, rect| {
+        total.saturating_add(u64::from(rect.width) * u64::from(rect.height))
     })
 }
 
-fn bounding_damage_pixels(damage: &[Rect]) -> u64 {
-    bounding_damage(damage).map_or(0, |rect| u64::from(rect.width) * u64::from(rect.height))
+fn merge_tiled_damage(
+    width: u32,
+    height: u32,
+    tile: u32,
+    existing: &[Rect],
+    damage: &[Rect],
+) -> Vec<Rect> {
+    let tile = tile.max(1);
+    let tiles_x = width.div_ceil(tile);
+    let tiles_y = height.div_ceil(tile);
+    let mut dirty = vec![false; (tiles_x * tiles_y) as usize];
+    for rect in existing.iter().chain(damage) {
+        let right = rect.x.saturating_add(rect.width).min(width);
+        let bottom = rect.y.saturating_add(rect.height).min(height);
+        if rect.x >= right || rect.y >= bottom {
+            continue;
+        }
+        for tile_y in rect.y / tile..=(bottom - 1) / tile {
+            for tile_x in rect.x / tile..=(right - 1) / tile {
+                dirty[(tile_y * tiles_x + tile_x) as usize] = true;
+            }
+        }
+    }
+    dirty
+        .into_iter()
+        .enumerate()
+        .filter(|(_, dirty)| *dirty)
+        .map(|(index, _)| {
+            let tile_x = index as u32 % tiles_x;
+            let tile_y = index as u32 / tiles_x;
+            let x = tile_x * tile;
+            let y = tile_y * tile;
+            Rect {
+                x,
+                y,
+                width: tile.min(width - x),
+                height: tile.min(height - y),
+            }
+        })
+        .collect()
 }
 
 fn duration_us(duration: Duration) -> u32 {
@@ -789,6 +816,29 @@ mod tests {
             RefreshPolicyConfig::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn settled_damage_keeps_distant_tiles_sparse() {
+        let damage = merge_tiled_damage(
+            8,
+            2,
+            2,
+            &[Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            }],
+            &[Rect {
+                x: 6,
+                y: 0,
+                width: 2,
+                height: 2,
+            }],
+        );
+        assert_eq!(damage.len(), 2);
+        assert_eq!(damage_pixels(&damage), 8);
     }
 
     #[test]

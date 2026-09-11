@@ -369,9 +369,9 @@ without replacing the active high-level profile:
 - `partial_refresh_enabled` permits or forbids partial panel updates;
 - `cleanup_after_updates` schedules a complete cleanup after that many
   successful physical partial panel submissions; zero disables this trigger;
-- `large_update_threshold_percent` schedules cleanup when bounding damage
-  covers the configured panel percentage; zero disables it, and 1..100 are
-  valid thresholds.
+- `large_update_threshold_percent` schedules cleanup at the next `SETTLED`
+  barrier when the unique damaged tiles cover the configured panel percentage;
+  zero disables it, and 1..100 are valid thresholds.
 - `static_cleanup_after_fast_updates` waits for a `SETTLED` barrier and then
   schedules one cleanup after the configured number of successful Fast/Fastest
   submissions; zero disables it.

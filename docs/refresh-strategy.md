@@ -103,7 +103,7 @@ The receiver reports the selected cause in
 4. `FIRST_FRAME`: the profile requests a clean initial physical presentation.
 5. `PERIODIC`: successful partial submissions reached
    `cleanup_after_updates`.
-6. `LARGE_DAMAGE`: bounding damage reached
+6. `LARGE_DAMAGE`: at `SETTLED`, the unique damaged tiles reached
    `large_update_threshold_percent`.
 
 `cleanup_after_updates=0`, `large_update_threshold_percent=0`, and

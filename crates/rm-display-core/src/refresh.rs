@@ -257,7 +257,8 @@ impl RefreshPolicy {
         panel_pixels: u64,
         force_cleanup: bool,
     ) -> RefreshDecision {
-        let area_cleanup_due = self.config.large_update_threshold_percent > 0
+        let area_cleanup_due = intent == FrameIntent::Settled
+            && self.config.large_update_threshold_percent > 0
             && damage_pixels.saturating_mul(100)
                 >= panel_pixels
                     .saturating_mul(u64::from(self.config.large_update_threshold_percent));
@@ -495,20 +496,28 @@ mod tests {
     }
 
     #[test]
-    fn quality_profile_cleans_large_updates() {
+    fn large_update_cleanup_waits_until_settled() {
         let mut config = RefreshPolicyConfig::for_profile(RefreshProfile::Quality);
         config.clean_first_frame = false;
         let policy = RefreshPolicy::new(config).unwrap();
-        let decision = policy.decide(
+        let moving = policy.decide(
             FrameIntent::Latest,
             ContentClass::TextUi,
             3_300,
             10_000,
             false,
         );
-        assert!(decision.complete_refresh);
-        assert_eq!(decision.waveform, Waveform::FullQuality);
-        assert_eq!(decision.full_refresh_reason, FullRefreshReason::LargeDamage);
+        assert!(!moving.complete_refresh);
+        let settled = policy.decide(
+            FrameIntent::Settled,
+            ContentClass::TextUi,
+            3_300,
+            10_000,
+            false,
+        );
+        assert!(settled.complete_refresh);
+        assert_eq!(settled.waveform, Waveform::FullQuality);
+        assert_eq!(settled.full_refresh_reason, FullRefreshReason::LargeDamage);
     }
 
     #[test]
