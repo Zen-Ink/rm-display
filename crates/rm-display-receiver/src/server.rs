@@ -477,7 +477,7 @@ fn drive_connection<T: Read + Write>(
 
         while let Some(envelope) = codec.decode(&mut input)? {
             let related = envelope.message_id;
-            match session.handle(envelope, started.elapsed()) {
+            match session.handle_deferred(envelope, started.elapsed()) {
                 Ok(responses) => write_envelopes(stream, &codec, responses)?,
                 Err(error) => {
                     let response = session.protocol_error(&error, related);
@@ -498,6 +498,7 @@ fn drive_connection<T: Read + Write>(
                 };
             }
         }
+        write_envelopes(stream, &codec, session.poll(started.elapsed())?)?;
 
         match stream.read(&mut read_buffer) {
             Ok(0) => return Ok(()),

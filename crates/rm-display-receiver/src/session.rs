@@ -161,6 +161,23 @@ impl<'a> Session<'a> {
         envelope: Envelope,
         now: Duration,
     ) -> Result<Vec<Envelope>, SessionError> {
+        self.handle_inner(envelope, now, true)
+    }
+
+    pub(crate) fn handle_deferred(
+        &mut self,
+        envelope: Envelope,
+        now: Duration,
+    ) -> Result<Vec<Envelope>, SessionError> {
+        self.handle_inner(envelope, now, false)
+    }
+
+    fn handle_inner(
+        &mut self,
+        envelope: Envelope,
+        now: Duration,
+        poll_after: bool,
+    ) -> Result<Vec<Envelope>, SessionError> {
         self.validate_envelope_header(&envelope)?;
         let related_message_id = envelope.message_id;
         let body = envelope.body.ok_or(SessionError::MissingBody)?;
@@ -201,7 +218,9 @@ impl<'a> Session<'a> {
                 }
             }
         };
-        responses.extend(self.poll(now)?);
+        if poll_after {
+            responses.extend(self.poll(now)?);
+        }
         if self.closed && responses.is_empty() {
             let _ = related_message_id;
         }

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
@@ -61,6 +62,13 @@ struct SendMeasurement {
     wire_bytes: u64,
 }
 
+struct PendingFrame {
+    frame_id: u64,
+    decoded_bytes: u64,
+    started: Instant,
+    producer: ProducerFrameMetrics,
+}
+
 #[derive(Debug, Error)]
 pub enum ProducerError {
     #[error("transport I/O failed: {0}")]
@@ -117,6 +125,9 @@ pub struct ProducerClient {
     logical_frame_id: u64,
     credits: u32,
     byte_credits: u64,
+    credit_limit: u32,
+    byte_credit_limit: u64,
+    pending_frames: VecDeque<PendingFrame>,
     selected_minor: u32,
     zstd_enabled: bool,
     client_id: [u8; 16],
@@ -139,6 +150,9 @@ impl ProducerClient {
             logical_frame_id: 0,
             credits: 0,
             byte_credits: 0,
+            credit_limit: 0,
+            byte_credit_limit: 0,
+            pending_frames: VecDeque::new(),
             selected_minor: 0,
             zstd_enabled: false,
             client_id,
@@ -259,6 +273,7 @@ impl ProducerClient {
         requested_profile: EpaperProfile,
         custom: Option<EpaperProfileConfiguration>,
     ) -> Result<EpaperProfileResult, ProducerError> {
+        self.drain_queued_frame_reports()?;
         let supported = self.server_hello.as_ref().is_some_and(|hello| {
             hello
                 .features
@@ -349,6 +364,7 @@ impl ProducerClient {
         &mut self,
         mut request: EpaperRefreshRequest,
     ) -> Result<EpaperRefreshResult, ProducerError> {
+        self.drain_queued_frame_reports()?;
         let supported = self.server_hello.as_ref().is_some_and(|hello| {
             hello
                 .features
@@ -480,11 +496,14 @@ impl ProducerClient {
         self.next_frame_id = 1;
         self.logical_frame_id = 0;
         self.credits = limits.max_inflight;
+        self.credit_limit = limits.max_inflight;
         self.byte_credits = if self.selected_minor >= 1 {
             limits.max_inflight_bytes
         } else {
             u64::MAX
         };
+        self.byte_credit_limit = self.byte_credits;
+        self.pending_frames.clear();
         Ok(Surface {
             id: ready.surface_id,
             generation: ready.generation,
@@ -541,6 +560,89 @@ impl ProducerClient {
         )
     }
 
+    pub fn queue_delta_frame_report(
+        &mut self,
+        surface: &Surface,
+        previous: &[u8],
+        pixels: &[u8],
+        tile: u32,
+        content_class: ContentClass,
+    ) -> Result<Option<FrameReport>, ProducerError> {
+        if self.logical_frame_id == 0 {
+            return self
+                .send_frame_report(surface, pixels, FrameIntent::Latest, content_class)
+                .map(Some);
+        }
+        validate_frame_pixels(surface, pixels, Some(previous))?;
+        if self.credits == 0 {
+            return Err(ProducerError::NoCredit);
+        }
+        let started = Instant::now();
+        let build_started = Instant::now();
+        let regions = encode_delta_regions(
+            previous,
+            pixels,
+            surface.width,
+            surface.height,
+            tile,
+            (surface.max_regions as usize).min(MAX_DELTA_REGIONS),
+            self.zstd_enabled,
+        );
+        let decoded_bytes = regions
+            .iter()
+            .map(|region| u64::from(region.decoded_len))
+            .sum::<u64>();
+        if decoded_bytes > self.byte_credits {
+            return Err(ProducerError::NoCredit);
+        }
+        let frame_id = self.next_frame_id;
+        self.next_frame_id = self
+            .next_frame_id
+            .checked_add(1)
+            .ok_or(ProducerError::MessageOrder)?;
+        let frame = Frame {
+            surface_id: surface.id,
+            generation: surface.generation,
+            frame_id,
+            base_frame_id: self.logical_frame_id,
+            intent: FrameIntent::Latest as i32,
+            content_class: content_class as i32,
+            regions,
+            source_timestamp_us: 0,
+        };
+        let mut producer = ProducerFrameMetrics {
+            attempts: 1,
+            build_us: elapsed_us(build_started),
+            ..ProducerFrameMetrics::default()
+        };
+        self.credits -= 1;
+        self.byte_credits = self.byte_credits.saturating_sub(decoded_bytes);
+        let sent = self.send_measured(envelope::Body::Frame(frame))?;
+        producer.wire_encode_us = sent.wire_encode_us;
+        producer.write_us = sent.write_us;
+        producer.wire_bytes = sent.wire_bytes;
+        self.logical_frame_id = frame_id;
+        self.pending_frames.push_back(PendingFrame {
+            frame_id,
+            decoded_bytes,
+            started,
+            producer,
+        });
+        Ok(None)
+    }
+
+    pub fn wait_for_frame_credit_report(&mut self) -> Result<Option<FrameReport>, ProducerError> {
+        if self.credits > 0 || self.pending_frames.is_empty() {
+            Ok(None)
+        } else {
+            self.reap_queued_frame_report().map(Some)
+        }
+    }
+
+    pub fn pending_frame_count(&self) -> usize {
+        self.pending_frames.len()
+    }
+
     pub fn send_frame_report(
         &mut self,
         surface: &Surface,
@@ -559,34 +661,10 @@ impl ProducerClient {
         intent: FrameIntent,
         content_class: ContentClass,
     ) -> Result<FrameReport, ProducerError> {
+        self.drain_queued_frame_reports()?;
         let total_started = Instant::now();
         let mut producer = ProducerFrameMetrics::default();
-        let expected = (surface.width as usize)
-            .checked_mul(surface.height as usize)
-            .ok_or(ProducerError::FrameTooLarge {
-                actual: usize::MAX,
-                limit: surface.max_frame_bytes,
-            })?;
-        if pixels.len() != expected {
-            return Err(ProducerError::BadPixelLength {
-                actual: pixels.len(),
-                expected,
-            });
-        }
-        if pixels.len() > surface.max_frame_bytes {
-            return Err(ProducerError::FrameTooLarge {
-                actual: pixels.len(),
-                limit: surface.max_frame_bytes,
-            });
-        }
-        if let Some((previous, _)) = delta {
-            if previous.len() != expected {
-                return Err(ProducerError::BadPixelLength {
-                    actual: previous.len(),
-                    expected,
-                });
-            }
-        }
+        validate_frame_pixels(surface, pixels, delta.map(|(previous, _)| previous))?;
         let mut force_keyframe = self.logical_frame_id == 0;
         loop {
             let build_started = Instant::now();
@@ -700,6 +778,60 @@ impl ProducerClient {
             reason: 1,
             message: "producer completed".to_owned(),
         }))
+    }
+
+    fn drain_queued_frame_reports(&mut self) -> Result<(), ProducerError> {
+        while !self.pending_frames.is_empty() {
+            self.reap_queued_frame_report()?;
+        }
+        Ok(())
+    }
+
+    fn reap_queued_frame_report(&mut self) -> Result<FrameReport, ProducerError> {
+        loop {
+            let envelope = self.receive()?;
+            match envelope.body {
+                Some(envelope::Body::FrameResult(result)) => {
+                    let Some(index) = self
+                        .pending_frames
+                        .iter()
+                        .position(|pending| pending.frame_id == result.frame_id)
+                    else {
+                        return Err(ProducerError::UnexpectedMessage);
+                    };
+                    let mut pending = self.pending_frames.remove(index).unwrap();
+                    self.credits = self.credits.saturating_add(1).min(self.credit_limit);
+                    self.byte_credits = self
+                        .byte_credits
+                        .saturating_add(pending.decoded_bytes)
+                        .min(self.byte_credit_limit);
+                    pending.producer.wait_us = elapsed_us(pending.started);
+                    pending.producer.total_us = pending.producer.wait_us;
+                    let code = FrameResultCode::try_from(result.result)
+                        .unwrap_or(FrameResultCode::Unspecified);
+                    if matches!(
+                        code,
+                        FrameResultCode::Presented | FrameResultCode::Superseded
+                    ) {
+                        self.logical_frame_id = self.logical_frame_id.max(result.logical_frame_id);
+                        return Ok(FrameReport {
+                            result,
+                            producer: pending.producer,
+                        });
+                    }
+                    return Err(ProducerError::FrameRejected {
+                        frame_id: result.frame_id,
+                        result: result.result,
+                        reason: result.reason,
+                    });
+                }
+                Some(envelope::Body::Error(error)) if error.fatal => {
+                    return Err(ProducerError::Remote(error.message))
+                }
+                Some(body) => self.handle_auxiliary(body)?,
+                None => return Err(ProducerError::UnexpectedMessage),
+            }
+        }
     }
 
     pub fn pump_once(&mut self) -> Result<(), ProducerError> {
@@ -835,6 +967,40 @@ impl ProducerClient {
         self.last_received_id = envelope.message_id;
         Ok(envelope)
     }
+}
+
+fn validate_frame_pixels(
+    surface: &Surface,
+    pixels: &[u8],
+    previous: Option<&[u8]>,
+) -> Result<(), ProducerError> {
+    let expected = (surface.width as usize)
+        .checked_mul(surface.height as usize)
+        .ok_or(ProducerError::FrameTooLarge {
+            actual: usize::MAX,
+            limit: surface.max_frame_bytes,
+        })?;
+    if pixels.len() != expected {
+        return Err(ProducerError::BadPixelLength {
+            actual: pixels.len(),
+            expected,
+        });
+    }
+    if pixels.len() > surface.max_frame_bytes {
+        return Err(ProducerError::FrameTooLarge {
+            actual: pixels.len(),
+            limit: surface.max_frame_bytes,
+        });
+    }
+    if let Some(previous) = previous {
+        if previous.len() != expected {
+            return Err(ProducerError::BadPixelLength {
+                actual: previous.len(),
+                expected,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn encode_delta_regions(
@@ -1206,6 +1372,49 @@ mod tests {
         assert_eq!(frames[2].base_frame_id, 0);
         assert_eq!(frames[2].regions[0].data.as_ref(), [0, 1, 2, 7]);
         assert_eq!(frames[2].intent, FrameIntent::Settled as i32);
+    }
+
+    #[test]
+    fn queued_latest_frames_wait_only_when_credit_is_exhausted() {
+        let mut surface_ready = ready();
+        surface_ready.limits.as_mut().unwrap().max_inflight = 2;
+        let mut first_result = result(1, FrameResultCode::Presented, 1);
+        first_result.credits = 2;
+        let responses = framed_responses(vec![
+            envelope::Body::ServerHello(server_hello()),
+            envelope::Body::SurfaceReady(surface_ready),
+            envelope::Body::FrameResult(first_result),
+            envelope::Body::FrameResult(result(2, FrameResultCode::Superseded, 3)),
+        ]);
+        let mut client = ProducerClient::new(
+            Box::new(MockIo {
+                input: Cursor::new(responses),
+                output: Arc::new(Mutex::new(Vec::new())),
+            }),
+            [1; 16],
+        );
+        client.hello("test").unwrap();
+        let surface = client
+            .open_surface(0, 0, SourceKind::LinuxStream, false, "test")
+            .unwrap();
+        client
+            .send_frame_report(
+                &surface,
+                &[0, 1, 2, 3],
+                FrameIntent::Latest,
+                ContentClass::TextUi,
+            )
+            .unwrap();
+        for (previous, current) in [([0, 1, 2, 3], [0, 1, 2, 4]), ([0, 1, 2, 4], [0, 1, 2, 5])] {
+            assert!(client
+                .queue_delta_frame_report(&surface, &previous, &current, 1, ContentClass::TextUi,)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(client.pending_frame_count(), 2);
+        let report = client.wait_for_frame_credit_report().unwrap().unwrap();
+        assert_eq!(report.result.frame_id, 2);
+        assert_eq!(client.pending_frame_count(), 1);
     }
 
     #[test]
