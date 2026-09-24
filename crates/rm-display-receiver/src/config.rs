@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rm_display_core::{RefreshConfigError, RefreshPolicyConfig};
+use rm_display_core::{RefreshConfigError, RefreshPolicyConfig, Waveform};
 #[cfg(feature = "tls")]
 use rm_display_transport::Psk;
 use thiserror::Error;
@@ -70,6 +70,9 @@ pub struct ReceiverConfig {
     /// after negotiating custom-profile control; native Quill values and the
     /// decision to perform a complete refresh remain receiver-owned.
     pub refresh_policy: RefreshPolicyConfig,
+    /// Receiver-owned waveform for local pen ink. This stays separate from the
+    /// producer-controlled webpage refresh profile.
+    pub ink_waveform: Waveform,
     /// Explicit Type-B touchscreen override. If absent, production
     /// reMarkable Quill builds safely auto-discover a capable evdev device.
     /// `ReceiverServer::bind` replaces absence with the selected path only
@@ -91,6 +94,9 @@ impl ReceiverConfig {
             return Err(ConfigError::InvalidLimits);
         }
         self.refresh_policy.validate()?;
+        if self.ink_waveform == Waveform::FullQuality {
+            return Err(ConfigError::InvalidInkWaveform);
+        }
         Ok(())
     }
 }
@@ -103,4 +109,6 @@ pub enum ConfigError {
     InvalidLimits,
     #[error(transparent)]
     InvalidRefreshPolicy(#[from] RefreshConfigError),
+    #[error("local ink waveform must be fastest, fast, or quality")]
+    InvalidInkWaveform,
 }

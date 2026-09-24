@@ -65,6 +65,7 @@ fn main() -> Result<()> {
         name: "overlay smoke".into(),
         limits: ReceiverLimits::default(),
         refresh_policy: RefreshPolicyConfig::default(),
+        ink_waveform: rm_display_core::Waveform::Fastest,
         input_device: Some("synthetic-touch".into()),
     };
     let mut panel = MockPanel::new(32, 32);
@@ -150,6 +151,28 @@ fn main() -> Result<()> {
         .join()
         .map_err(|_| "client panicked")?
         .map_err(|e| format!("client: {e}"))?;
+    if !panel.submissions().iter().any(|s| {
+        s.refresh.waveform == rm_display_core::Waveform::Fastest
+            && !s.refresh.complete_refresh
+            && s.damage
+                == vec![Rect {
+                    x: 14,
+                    y: 14,
+                    width: 5,
+                    height: 5,
+                }]
+    }) {
+        return Err("local ink did not use the dedicated fastest waveform/exact nib bounds".into());
+    }
+    if panel
+        .submissions()
+        .iter()
+        .filter(|s| s.refresh.complete_refresh)
+        .count()
+        > 2
+    {
+        return Err("unexpected full refresh during local ink replay".into());
+    }
     if !panel
         .submissions()
         .iter()

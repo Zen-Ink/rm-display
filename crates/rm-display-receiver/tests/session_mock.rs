@@ -31,6 +31,7 @@ fn config() -> ReceiverConfig {
             ..ReceiverLimits::default()
         },
         refresh_policy: RefreshPolicyConfig::default(),
+        ink_waveform: Waveform::Fastest,
         input_device: None,
     }
 }

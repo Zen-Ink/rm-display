@@ -375,6 +375,8 @@ impl ReceiverServer {
                 self.panel.as_mut(),
                 Some(self.pairing_frame.clone()),
                 #[cfg(target_os = "linux")]
+                |stream| (stream.get_ref().as_raw_fd(), stream.ssl().pending() > 0),
+                #[cfg(target_os = "linux")]
                 self.input.as_mut(),
                 #[cfg(target_os = "linux")]
                 &mut self.pen,
@@ -389,6 +391,8 @@ impl ReceiverServer {
             self.config.clone(),
             self.panel.as_mut(),
             Some(self.pairing_frame.clone()),
+            #[cfg(target_os = "linux")]
+            |stream| (stream.as_raw_fd(), false),
             #[cfg(target_os = "linux")]
             self.input.as_mut(),
             #[cfg(target_os = "linux")]
@@ -499,11 +503,13 @@ fn open_pen(panel: &dyn PanelBackend) -> (Option<EvdevPenDevice>, String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_connection<T: Read + Write>(
     stream: &mut T,
     config: ReceiverConfig,
     panel: &mut dyn PanelBackend,
     fallback: Option<GraySurface>,
+    #[cfg(target_os = "linux")] network_readiness: fn(&T) -> (std::os::fd::RawFd, bool),
     #[cfg(target_os = "linux")] input_device: Option<&mut EvdevTouchDevice>,
     #[cfg(target_os = "linux")] pen: &mut Option<EvdevPenDevice>,
     #[cfg(target_os = "linux")] power_key: Option<&PowerKeyDevice>,
@@ -532,12 +538,6 @@ fn drive_connection<T: Read + Write>(
     loop {
         let now = started.elapsed();
         #[cfg(target_os = "linux")]
-        if let Some(device) = input_device.as_deref_mut() {
-            let reports = device.drain_reports()?;
-            let envelopes = session.input_reports(reports, now)?;
-            write_envelopes(stream, &codec, envelopes)?;
-        }
-        #[cfg(target_os = "linux")]
         if let Some(device) = pen.as_mut() {
             match device.drain_reports() {
                 Ok(reports) => write_envelopes(stream, &codec, session.pen_reports(reports, now)?)?,
@@ -550,6 +550,12 @@ fn drive_connection<T: Read + Write>(
                     write_envelopes(stream, &codec, envelopes)?;
                 }
             }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(device) = input_device.as_deref_mut() {
+            let reports = device.drain_reports()?;
+            let envelopes = session.input_reports(reports, now)?;
+            write_envelopes(stream, &codec, envelopes)?;
         }
         // Process queued pen DOWN before presenting a newer pending base.
         write_envelopes(stream, &codec, session.poll(now)?)?;
@@ -594,6 +600,45 @@ fn drive_connection<T: Read + Write>(
             }
         }
         write_envelopes(stream, &codec, session.poll(started.elapsed())?)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let (network_fd, buffered) = network_readiness(stream);
+            if !buffered {
+                let mut descriptors = vec![libc::pollfd {
+                    fd: network_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                }];
+                for fd in [
+                    pen.as_ref().map(EvdevPenDevice::event_fd),
+                    input_device.as_ref().map(|d| d.event_fd()),
+                    power_key.map(PowerKeyDevice::event_fd),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    descriptors.push(libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    });
+                }
+                // Wake immediately for evdev. Timeout only services idle display
+                // deadlines; it no longer adds a socket-read delay to every nib sample.
+                let ready =
+                    unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, 10) };
+                if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    return Err(ServerError::Io(io::Error::last_os_error()));
+                }
+                if descriptors[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) == 0 {
+                    continue;
+                }
+                // Read ready network bytes without starving them during a
+                // continuous stroke. The next iteration drains pen before
+                // decoding these bytes, preserving first-DOWN freeze ordering.
+            }
+        }
 
         match stream.read(&mut read_buffer) {
             Ok(0) => return Ok(()),
@@ -681,6 +726,7 @@ mod tests {
             name: "pairing test".into(),
             limits: ReceiverLimits::default(),
             refresh_policy: RefreshPolicyConfig::default(),
+            ink_waveform: Waveform::Fastest,
             input_device: None,
         };
         let mut server = ReceiverServer::bind(config, Box::new(MockPanel::new(960, 1696))).unwrap();

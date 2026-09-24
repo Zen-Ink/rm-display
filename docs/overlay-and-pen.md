@@ -39,8 +39,15 @@ feedback submission gestures belong to the host bridge.
 
 Ink is drawn locally, without a network round trip: each drained pen batch
 rasterizes into a separate plane, then updates dirty bounds through reusable
-pixel buffers. Pen presentation uses the receiver's LATEST text policy; the
-receiver still owns cleanup and native waveform selection. Pen width is
+pixel buffers. Pen presentation uses an independent partial Fastest waveform
+(RM2 native mode 0), bypassing webpage FPS and quality policy. Its exact dirty
+rectangle is not expanded to webpage damage tiles. Generic idle cleanup is
+paused while the frozen page's pen remains in proximity. Explicit receiver
+cleanup/menu actions remain available. `RM_DISPLAY_INK_WAVEFORM=fastest|fast|quality`
+selects a hardware calibration override (default `fastest`). Connected input
+polls evdev and the socket together, drains pen before touch/network processing,
+and handles buffered TLS data without waiting for another socket wakeup.
+Pen width is
 currently 5 physical pixels and eraser diameter 25. Pressure is forwarded but
 does not currently change local pen width. Menu entry sends CANCEL for previously forwarded touch contacts and the last
 pen contact/proximity, then clears the current ink segment. Menu interactions

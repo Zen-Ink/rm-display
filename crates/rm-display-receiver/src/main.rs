@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rand::{rngs::OsRng, RngCore};
-use rm_display_core::{MockPanel, PanelBackend, RefreshPolicyConfig, RefreshProfile};
+use rm_display_core::{MockPanel, PanelBackend, RefreshPolicyConfig, RefreshProfile, Waveform};
 use rm_display_receiver::{
     ReceiverConfig, ReceiverLimits, ReceiverServer, ReservedZeroToken, SecurityMode,
 };
@@ -68,6 +68,7 @@ fn run() -> Result<(), String> {
         name: "rm-display".into(),
         limits: ReceiverLimits::default(),
         refresh_policy,
+        ink_waveform: parse_ink_waveform(env::var("RM_DISPLAY_INK_WAVEFORM").ok().as_deref())?,
         input_device: arguments.input_device,
     };
     let panel = create_panel(arguments.mock_geometry)?;
@@ -91,6 +92,15 @@ fn run() -> Result<(), String> {
         eprintln!("rm-display-receiver: pairing QR displayed");
     }
     server.run().map_err(|error| error.to_string())
+}
+
+fn parse_ink_waveform(value: Option<&str>) -> Result<Waveform, String> {
+    match value {
+        None | Some("fastest") => Ok(Waveform::Fastest),
+        Some("fast") => Ok(Waveform::Fast),
+        Some("quality") => Ok(Waveform::Quality),
+        Some(_) => Err("RM_DISPLAY_INK_WAVEFORM must be fastest, fast or quality".into()),
+    }
 }
 
 fn create_panel(mock_geometry: Option<(u32, u32)>) -> Result<Box<dyn PanelBackend>, String> {
@@ -379,7 +389,10 @@ fn usage() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_create_psk, load_or_create_server_id, Arguments, RefreshProfile};
+    use super::{
+        load_or_create_psk, load_or_create_server_id, parse_ink_waveform, Arguments,
+        RefreshProfile, Waveform,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -417,6 +430,17 @@ mod tests {
         assert_eq!(arguments.full_refresh_interval, None);
         assert_eq!(arguments.damage_tile, 64);
         assert!(arguments.pairing_qr);
+    }
+
+    #[test]
+    fn parses_local_ink_waveform() {
+        assert_eq!(parse_ink_waveform(None).unwrap(), Waveform::Fastest);
+        assert_eq!(parse_ink_waveform(Some("fast")).unwrap(), Waveform::Fast);
+        assert_eq!(
+            parse_ink_waveform(Some("quality")).unwrap(),
+            Waveform::Quality
+        );
+        assert!(parse_ink_waveform(Some("full-quality")).is_err());
     }
 
     #[test]

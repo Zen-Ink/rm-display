@@ -108,6 +108,7 @@ pub struct DisplayCore {
     overlay: LocalOverlay,
     peer_overlay: LocalOverlay,
     ink: LocalOverlay,
+    ink_waveform: Waveform,
     presented_base: GraySurface,
     presented: GraySurface,
     working: GraySurface,
@@ -168,6 +169,7 @@ impl DisplayCore {
             overlay: LocalOverlay::transparent(width, height)?,
             peer_overlay: LocalOverlay::transparent(width, height)?,
             ink: LocalOverlay::transparent(width, height)?,
+            ink_waveform: Waveform::Fastest,
             presented_base: GraySurface::new_with_format(width, height, pixel_format)?,
             presented: GraySurface::new_with_format(width, height, pixel_format)?,
             working: GraySurface::new_with_format(width, height, pixel_format)?,
@@ -301,6 +303,10 @@ impl DisplayCore {
         Ok(changed)
     }
 
+    pub fn set_ink_waveform(&mut self, waveform: Waveform) {
+        self.ink_waveform = waveform;
+    }
+
     pub fn peer_overlay_mut(&mut self) -> &mut LocalOverlay {
         &mut self.peer_overlay
     }
@@ -370,18 +376,44 @@ impl DisplayCore {
         self.working.blend_regions(&self.peer_overlay, &regions)?;
         self.working.blend_regions(&self.ink, &regions)?;
         self.working.blend_regions(&self.overlay, &regions)?;
-        let damage =
-            tile_damage_regions(&self.presented, &self.working, self.damage_tile, &regions);
+        let damage = if intent == FrameIntent::Latest {
+            // Pen damage already has exact clipped bounds. Avoid expanding a
+            // five-pixel nib to a 64x64 webpage damage tile.
+            let stride = self.width() as usize * self.working.bytes_per_pixel();
+            let bpp = self.working.bytes_per_pixel();
+            regions
+                .into_iter()
+                .filter(|r| {
+                    (r.y..r.y + r.height).any(|y| {
+                        let left = y as usize * stride + r.x as usize * bpp;
+                        let right = left + r.width as usize * bpp;
+                        self.working.pixels()[left..right] != self.presented.pixels()[left..right]
+                    })
+                })
+                .collect()
+        } else {
+            tile_damage_regions(&self.presented, &self.working, self.damage_tile, &regions)
+        };
         if damage.is_empty() {
             return Ok(terminals);
         }
-        let decision = self.refresh_policy.decide(
-            intent,
-            ContentClass::TextUi,
-            damage_pixels(&damage),
-            u64::from(self.width()) * u64::from(self.height()),
-            false,
-        );
+        let decision = if intent == FrameIntent::Latest {
+            // Handwriting never inherits webpage quality/full-refresh policy.
+            // Cleanup remains available on idle or explicit receiver commands.
+            RefreshDecision {
+                waveform: self.ink_waveform,
+                complete_refresh: false,
+                full_refresh_reason: FullRefreshReason::None,
+            }
+        } else {
+            self.refresh_policy.decide(
+                intent,
+                ContentClass::TextUi,
+                damage_pixels(&damage),
+                u64::from(self.width()) * u64::from(self.height()),
+                false,
+            )
+        };
         let damage =
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);

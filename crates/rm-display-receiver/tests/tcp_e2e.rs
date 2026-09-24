@@ -29,6 +29,7 @@ fn plaintext_loopback_server_exchanges_framed_hello_and_surface() {
         name: "tcp e2e".into(),
         limits: ReceiverLimits::default(),
         refresh_policy: RefreshPolicyConfig::default(),
+        ink_waveform: rm_display_core::Waveform::Fastest,
         input_device: None,
     };
     let mut server = ReceiverServer::bind(config, Box::new(MockPanel::new(4, 3))).unwrap();
@@ -57,6 +58,7 @@ fn psk_server_exchanges_protocol_over_tls13_aes128_gcm() {
         name: "psk tcp e2e".into(),
         limits: ReceiverLimits::default(),
         refresh_policy: RefreshPolicyConfig::default(),
+        ink_waveform: rm_display_core::Waveform::Fastest,
         input_device: None,
     };
     let mut server = ReceiverServer::bind(config, Box::new(MockPanel::new(4, 3))).unwrap();

@@ -212,6 +212,7 @@ mod tests {
             name: "rm-display".into(),
             limits: ReceiverLimits::default(),
             refresh_policy: RefreshPolicyConfig::default(),
+            ink_waveform: rm_display_core::Waveform::Fastest,
             input_device: None,
         }
     }

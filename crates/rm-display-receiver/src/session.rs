@@ -466,6 +466,11 @@ impl<'a> Session<'a> {
     pub fn poll(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {
         let terminals = match self.surface.as_mut() {
             Some(surface) => {
+                // A frozen annotation has no pending webpage work. Keep idle
+                // webpage cleanup from inserting quality flashes under the nib.
+                if surface.local_ink && surface.ink_frozen && surface.last_pen.is_some() {
+                    return Ok(Vec::new());
+                }
                 let terminals = surface.core.tick(now, self.panel)?;
                 self.cleanup_pending_without_surface = surface.core.cleanup_pending();
                 self.refresh_debt_without_surface = surface.core.refresh_debt();
@@ -902,6 +907,7 @@ impl<'a> Session<'a> {
             Duration::from_millis(self.config.limits.settled_deadline_ms as u64),
             self.config.refresh_policy,
         )?;
+        core.set_ink_waveform(self.config.ink_waveform);
         if carry_cleanup {
             core.require_cleanup();
         }
