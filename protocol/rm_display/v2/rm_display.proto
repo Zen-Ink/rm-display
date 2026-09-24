@@ -28,6 +28,8 @@ enum ProtocolFeature {
   PROTOCOL_FEATURE_BYTE_CREDITS = 12;
   // Protocol v2.2: atomic custom e-paper waveform/refresh-policy control.
   PROTOCOL_FEATURE_EPAPER_CUSTOM_PROFILE = 13;
+  PROTOCOL_FEATURE_REMOTE_OVERLAY = 14;
+  PROTOCOL_FEATURE_LOCAL_INK = 15;
 }
 
 enum ProducerKind {
@@ -117,6 +119,7 @@ enum FrameResultReason {
   FRAME_RESULT_REASON_NO_CREDIT = 7;
   FRAME_RESULT_REASON_BACKEND_FAILURE = 8;
   FRAME_RESULT_REASON_PROTOCOL_STATE = 9;
+  FRAME_RESULT_REASON_INK_FROZEN = 10;
 }
 
 // Diagnostic reason for a receiver-selected complete panel refresh. This does
@@ -264,6 +267,8 @@ message Envelope {
     EpaperProfileResult epaper_profile_result = 46;
     EpaperRefreshRequest epaper_refresh_request = 47;
     EpaperRefreshResult epaper_refresh_result = 48;
+    OverlayUpdate overlay_update = 100;
+    OverlayResult overlay_result = 101;
   }
 
   reserved 16 to 19;
@@ -448,6 +453,8 @@ message InputBatch {
   fixed64 sequence = 3;
   fixed64 monotonic_us = 4;
   repeated PointerRecord records = 5;
+  fixed64 presented_frame_id = 32;
+  bool ink_frozen = 33;
   reserved 6 to 31;
 }
 
@@ -578,4 +585,30 @@ message EpaperRefreshResult {
   bool cleanup_performed = 5;
   string message = 6;
   reserved 7 to 31;
+}
+
+// v2.3, negotiated REMOTE_OVERLAY. One raw grayscale + alpha rectangle per
+// command, bounded by Limits.max_frame_bytes and max_payload. Empty clear
+// removes the entire peer plane. Receiver menu is always a separate top plane.
+message OverlayUpdate {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 sequence = 3; // Nonzero, strictly increasing per session.
+  bool clear = 4;
+  Rect rect = 5;
+  bytes luma = 6;
+  bytes alpha = 7;
+  // Requires LOCAL_INK. Enabling arms freeze on first pen DOWN; disabling
+  // releases the base and clears local ink. clear also clears local ink but
+  // preserves an existing freeze until explicitly disabled.
+  optional bool local_ink = 8;
+}
+message OverlayResult {
+  uint32 surface_id = 1;
+  uint32 generation = 2;
+  fixed64 sequence = 3;
+  bool applied = 4;
+  string message = 5;
+  fixed64 presented_frame_id = 6;
+  bool ink_frozen = 7;
 }

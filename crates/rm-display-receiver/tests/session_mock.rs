@@ -10,9 +10,9 @@ use rm_display_protocol::{
     ClientHello, ContentClass, Encoding, Envelope, EpaperProfile, EpaperProfileConfiguration,
     EpaperProfileOperation, EpaperProfileRequest, EpaperProfileResultCode, EpaperRefreshOperation,
     EpaperRefreshRequest, EpaperRefreshResultCode, EpaperWaveform, Frame, FrameIntent,
-    FrameResultCode, FrameResultReason, InputCapability, PixelFormat,
-    PointerPhase as ProtocolPointerPhase, ProducerKind, ProtocolFeature, Rect, SourceKind,
-    SurfaceClose, SurfaceOpen,
+    FrameResultCode, FrameResultReason, InputCapability, OverlayUpdate, PixelFormat, PointerDevice,
+    PointerPhase as ProtocolPointerPhase, PointerRecord, ProducerKind, ProtocolFeature, Rect,
+    SourceKind, SurfaceClose, SurfaceOpen,
 };
 use rm_display_receiver::evdev::{PhysicalPointerEvent, PointerPhase};
 use rm_display_receiver::{
@@ -87,6 +87,16 @@ fn hello_v22_custom_profile() -> ClientHello {
     hello
 }
 
+fn hello_v23_overlay() -> ClientHello {
+    let mut hello = hello_v22_custom_profile();
+    hello.max_minor = 3;
+    hello.features.extend([
+        ProtocolFeature::RemoteOverlay as i32,
+        ProtocolFeature::LocalInk as i32,
+    ]);
+    hello
+}
+
 fn frame(surface: u32, generation: u32, id: u64, base: u64, value: u8) -> Frame {
     Frame {
         surface_id: surface,
@@ -128,6 +138,156 @@ fn color_frame(surface: u32, generation: u32, id: u64, base: u64, value: u16) ->
         )],
         source_timestamp_us: 0,
     }
+}
+
+#[test]
+fn v23_overlay_and_local_ink_freeze_preserve_the_frame_base() {
+    let mut panel = MockPanel::new(4, 3);
+    let mut session = Session::new(config(), &mut panel);
+    session.set_pen_available(true);
+    let response = session
+        .handle(
+            envelope(0, 1, Body::ClientHello(hello_v23_overlay())),
+            Duration::ZERO,
+        )
+        .unwrap();
+    assert!(matches!(
+        &response[0].body,
+        Some(Body::ServerHello(hello))
+            if hello.selected_minor == 3
+                && hello.features.contains(&(ProtocolFeature::RemoteOverlay as i32))
+                && hello.features.contains(&(ProtocolFeature::LocalInk as i32))
+    ));
+
+    let session_id = session.session_id();
+    let ready = session
+        .handle(
+            envelope(
+                session_id,
+                2,
+                Body::SurfaceOpen(SurfaceOpen {
+                    surface_id: 23,
+                    pixel_format: PixelFormat::Gray8 as i32,
+                    source_kind: SourceKind::TestPattern as i32,
+                    input_capabilities: vec![InputCapability::Pen as i32],
+                    ..Default::default()
+                }),
+            ),
+            Duration::ZERO,
+        )
+        .unwrap();
+    let generation = match &ready[0].body {
+        Some(Body::SurfaceReady(ready)) => ready.generation,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    session
+        .handle(
+            envelope(session_id, 3, Body::Frame(frame(23, generation, 1, 0, 220))),
+            Duration::ZERO,
+        )
+        .unwrap();
+
+    let overlay = |sequence| OverlayUpdate {
+        surface_id: 23,
+        generation,
+        sequence,
+        ..Default::default()
+    };
+    let mut patch = overlay(1);
+    patch.rect = Some(Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+    });
+    patch.luma = vec![0].into();
+    patch.alpha = vec![255].into();
+    let patched = session
+        .handle(
+            envelope(session_id, 4, Body::OverlayUpdate(patch.clone())),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    assert!(matches!(
+        patched.last().and_then(|response| response.body.as_ref()),
+        Some(Body::OverlayResult(result)) if result.applied && result.presented_frame_id == 1
+    ));
+    let stale = session
+        .handle(
+            envelope(session_id, 5, Body::OverlayUpdate(patch)),
+            Duration::from_millis(2),
+        )
+        .unwrap();
+    assert!(matches!(
+        stale.last().and_then(|response| response.body.as_ref()),
+        Some(Body::OverlayResult(result)) if !result.applied
+    ));
+
+    let mut arm = overlay(2);
+    arm.local_ink = Some(true);
+    session
+        .handle(
+            envelope(session_id, 6, Body::OverlayUpdate(arm)),
+            Duration::from_millis(3),
+        )
+        .unwrap();
+    let pen = PointerRecord {
+        device: PointerDevice::Pen as i32,
+        phase: ProtocolPointerPhase::Down as i32,
+        x_16_16: 2 << 16,
+        y_16_16: 1 << 16,
+        pressure: 32000,
+        buttons: 1,
+        ..Default::default()
+    };
+    let input = session
+        .pen_reports(vec![vec![pen]], Duration::from_millis(4))
+        .unwrap();
+    assert!(matches!(
+        input[0].body,
+        Some(Body::InputBatch(ref batch))
+            if batch.ink_frozen && batch.presented_frame_id == 1
+    ));
+
+    let rejected = session
+        .handle(
+            envelope(session_id, 7, Body::Frame(frame(23, generation, 2, 1, 100))),
+            Duration::from_millis(5),
+        )
+        .unwrap();
+    assert!(matches!(
+        rejected[0].body,
+        Some(Body::FrameResult(ref result))
+            if result.result == FrameResultCode::Rejected as i32
+                && result.reason == FrameResultReason::InkFrozen as i32
+                && result.presented_frame_id == 1
+    ));
+
+    let mut release = overlay(3);
+    release.clear = true;
+    release.local_ink = Some(false);
+    let released = session
+        .handle(
+            envelope(session_id, 8, Body::OverlayUpdate(release)),
+            Duration::from_millis(6),
+        )
+        .unwrap();
+    assert!(matches!(
+        released.last().and_then(|response| response.body.as_ref()),
+        Some(Body::OverlayResult(result)) if result.applied && !result.ink_frozen
+    ));
+    let mut resumed = session
+        .handle(
+            envelope(session_id, 9, Body::Frame(frame(23, generation, 3, 0, 180))),
+            Duration::from_millis(7),
+        )
+        .unwrap();
+    resumed.extend(session.poll(Duration::from_millis(300)).unwrap());
+    assert!(resumed.iter().any(|response| matches!(
+        response.body,
+        Some(Body::FrameResult(ref result))
+            if result.frame_id == 3 && result.result == FrameResultCode::Presented as i32
+    )));
 }
 
 #[test]

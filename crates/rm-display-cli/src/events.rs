@@ -13,6 +13,8 @@ pub fn write_event_jsonl(envelope: &Envelope, output: &mut dyn Write) -> Result<
             "generation": batch.generation,
             "sequence": batch.sequence,
             "monotonic_us": batch.monotonic_us,
+            "presented_frame_id": batch.presented_frame_id,
+            "ink_frozen": batch.ink_frozen,
             "records": batch.records.iter().map(|record| json!({
                 "device": record.device,
                 "phase": record.phase,

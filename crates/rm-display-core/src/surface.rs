@@ -198,6 +198,47 @@ impl PixelSurface {
         Self::from_pixels_with_format(self.width, self.height, self.format, pixels)
     }
 
+    pub(crate) fn blend_regions(
+        &mut self,
+        overlay: &LocalOverlay,
+        regions: &[Rect],
+    ) -> Result<(), SurfaceError> {
+        if overlay.is_transparent() {
+            return Ok(());
+        }
+        if overlay.len() != self.width as usize * self.height as usize {
+            return Err(SurfaceError::BadOverlay);
+        }
+        for rect in regions {
+            validate_rect(self.width, self.height, rect)?;
+            for y in rect.y..rect.y + rect.height {
+                for x in rect.x..rect.x + rect.width {
+                    let i = y as usize * self.width as usize + x as usize;
+                    let a = overlay.alpha[i];
+                    if a == 0 {
+                        continue;
+                    }
+                    let l = overlay.luma[i];
+                    if self.format == PixelFormat::Gray8 {
+                        self.pixels[i] = blend(self.pixels[i], l, a);
+                    } else {
+                        let offset = i * 2;
+                        let p = u16::from_le_bytes([self.pixels[offset], self.pixels[offset + 1]]);
+                        self.pixels[offset..offset + 2].copy_from_slice(
+                            &pack_rgb565(
+                                blend(expand5((p >> 11) as u8), l, a),
+                                blend(expand6((p >> 5) as u8), l, a),
+                                blend(expand5(p as u8), l, a),
+                            )
+                            .to_le_bytes(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn compose_regions_into(
         &self,
         overlay: &LocalOverlay,
@@ -258,11 +299,12 @@ impl PixelSurface {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LocalOverlay {
     luma: Vec<u8>,
     alpha: Vec<u8>,
     transparent: bool,
+    dirty: Option<Rect>,
 }
 
 impl LocalOverlay {
@@ -272,6 +314,7 @@ impl LocalOverlay {
             luma: vec![0; len],
             alpha: vec![0; len],
             transparent: true,
+            dirty: None,
         })
     }
 
@@ -290,6 +333,93 @@ impl LocalOverlay {
     pub fn clear(&mut self) {
         self.alpha.fill(0);
         self.transparent = true;
+        self.dirty = None;
+    }
+
+    pub fn patch(
+        &mut self,
+        width: u32,
+        rect: &Rect,
+        luma: &[u8],
+        alpha: &[u8],
+    ) -> Result<(), SurfaceError> {
+        let count = rect.width as usize * rect.height as usize;
+        if width == 0
+            || rect.width == 0
+            || rect.height == 0
+            || rect.x.checked_add(rect.width).is_none_or(|end| end > width)
+            || rect
+                .y
+                .checked_add(rect.height)
+                .is_none_or(|end| end as usize > self.len() / width as usize)
+            || luma.len() != count
+            || alpha.len() != count
+        {
+            return Err(SurfaceError::BadOverlay);
+        }
+        for row in 0..rect.height as usize {
+            let dst = (rect.y as usize + row) * width as usize + rect.x as usize;
+            let src = row * rect.width as usize;
+            self.luma[dst..dst + rect.width as usize]
+                .copy_from_slice(&luma[src..src + rect.width as usize]);
+            self.alpha[dst..dst + rect.width as usize]
+                .copy_from_slice(&alpha[src..src + rect.width as usize]);
+        }
+        self.transparent = !self.alpha.iter().any(|value| *value != 0);
+        Ok(())
+    }
+
+    /// Bounded raster segment for local ink; eraser clears this plane only.
+    pub fn take_dirty(&mut self) -> Option<Rect> {
+        self.dirty.take()
+    }
+
+    pub fn ink_line(
+        &mut self,
+        width: u32,
+        from: (u32, u32),
+        to: (u32, u32),
+        radius: u32,
+        erase: bool,
+    ) {
+        let height = self.len() / width as usize;
+        let dx = to.0 as i64 - from.0 as i64;
+        let dy = to.1 as i64 - from.1 as i64;
+        let steps = dx.abs().max(dy.abs()).max(1);
+        for step in 0..=steps {
+            let x = from.0 as i64 + dx * step / steps;
+            let y = from.1 as i64 + dy * step / steps;
+            for py in (y - radius as i64).max(0)..=(y + radius as i64).min(height as i64 - 1) {
+                for px in (x - radius as i64).max(0)..=(x + radius as i64).min(width as i64 - 1) {
+                    if (px - x).pow(2) + (py - y).pow(2) <= (radius as i64).pow(2) {
+                        let i = py as usize * width as usize + px as usize;
+                        self.luma[i] = 0;
+                        self.alpha[i] = if erase { 0 } else { 255 };
+                    }
+                }
+            }
+        }
+        // Conservative occupancy avoids scanning the full panel per pen sample.
+        self.transparent = false;
+        let left = from.0.min(to.0).saturating_sub(radius);
+        let top = from.1.min(to.1).saturating_sub(radius);
+        let right = (from.0.max(to.0) + radius + 1).min(width);
+        let bottom = (from.1.max(to.1) + radius + 1).min(height as u32);
+        let mut rect = Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        };
+        if let Some(old) = self.dirty.take() {
+            let right = right.max(old.x + old.width);
+            let bottom = bottom.max(old.y + old.height);
+            rect.x = rect.x.min(old.x);
+            rect.y = rect.y.min(old.y);
+            rect.width = right - rect.x;
+            rect.height = bottom - rect.y;
+        }
+        self.dirty = Some(rect);
     }
 
     pub fn replace_planes(&mut self, luma: &[u8], alpha: &[u8]) -> Result<(), SurfaceError> {

@@ -5,9 +5,9 @@ use thiserror::Error;
 
 use crate::surface::tile_damage_regions;
 use crate::{
-    tile_damage, FullRefreshReason, GraySurface, LocalOverlay, PanelBackend, PanelError,
-    RefreshConfigError, RefreshDebt, RefreshDecision, RefreshPolicy, RefreshPolicyConfig,
-    RefreshProfile, SurfaceError, Waveform,
+    FullRefreshReason, GraySurface, LocalOverlay, PanelBackend, PanelError, RefreshConfigError,
+    RefreshDebt, RefreshDecision, RefreshPolicy, RefreshPolicyConfig, RefreshProfile, SurfaceError,
+    Waveform,
 };
 
 const REALTIME_CLEANUP: (u64, Duration) = (8, Duration::from_secs(10));
@@ -106,6 +106,9 @@ struct PendingPresentation {
 pub struct DisplayCore {
     base: GraySurface,
     overlay: LocalOverlay,
+    peer_overlay: LocalOverlay,
+    ink: LocalOverlay,
+    presented_base: GraySurface,
     presented: GraySurface,
     working: GraySurface,
     logical_frame_id: u64,
@@ -163,6 +166,9 @@ impl DisplayCore {
         Ok(Self {
             base: GraySurface::new_with_format(width, height, pixel_format)?,
             overlay: LocalOverlay::transparent(width, height)?,
+            peer_overlay: LocalOverlay::transparent(width, height)?,
+            ink: LocalOverlay::transparent(width, height)?,
+            presented_base: GraySurface::new_with_format(width, height, pixel_format)?,
             presented: GraySurface::new_with_format(width, height, pixel_format)?,
             working: GraySurface::new_with_format(width, height, pixel_format)?,
             logical_frame_id: 0,
@@ -295,6 +301,28 @@ impl DisplayCore {
         Ok(changed)
     }
 
+    pub fn peer_overlay_mut(&mut self) -> &mut LocalOverlay {
+        &mut self.peer_overlay
+    }
+    pub fn ink_mut(&mut self) -> &mut LocalOverlay {
+        &mut self.ink
+    }
+    pub fn freeze_presented(&mut self) -> Option<TerminalFrame> {
+        let terminal = self.cancel_pending();
+        self.base.clone_from(&self.presented_base);
+        // Preserve monotonic frame IDs; only a fresh keyframe may resume.
+        self.base_valid = false;
+        terminal
+    }
+    fn compose_base(&self) -> Result<std::borrow::Cow<'_, GraySurface>, SurfaceError> {
+        if self.peer_overlay.is_transparent() && self.ink.is_transparent() {
+            return Ok(std::borrow::Cow::Borrowed(&self.base));
+        }
+        Ok(std::borrow::Cow::Owned(
+            self.base.compose(&self.peer_overlay)?.compose(&self.ink)?,
+        ))
+    }
+
     pub fn overlay_mut(&mut self) -> &mut LocalOverlay {
         &mut self.overlay
     }
@@ -308,18 +336,47 @@ impl DisplayCore {
         now: Duration,
         panel: &mut dyn PanelBackend,
     ) -> Result<Vec<TerminalFrame>, CoreError> {
+        self.present_plane(now, panel, FrameIntent::Settled)
+    }
+
+    pub fn present_ink(
+        &mut self,
+        now: Duration,
+        panel: &mut dyn PanelBackend,
+    ) -> Result<Vec<TerminalFrame>, CoreError> {
+        self.present_plane(now, panel, FrameIntent::Latest)
+    }
+
+    fn present_plane(
+        &mut self,
+        now: Duration,
+        panel: &mut dyn PanelBackend,
+        intent: FrameIntent,
+    ) -> Result<Vec<TerminalFrame>, CoreError> {
         let terminals = if self.pending.is_some() {
             self.tick_inner(now, panel, true)?
         } else {
             Vec::new()
         };
-        let composed = self.base.compose(&self.overlay)?;
-        let damage = tile_damage(&self.presented, &composed, self.damage_tile);
+        let regions = if intent == FrameIntent::Latest {
+            self.ink.take_dirty().into_iter().collect::<Vec<_>>()
+        } else {
+            full_damage(self.width(), self.height())
+        };
+        if regions.is_empty() {
+            return Ok(terminals);
+        }
+        self.working.copy_regions_from(&self.base, &regions)?;
+        self.working.blend_regions(&self.peer_overlay, &regions)?;
+        self.working.blend_regions(&self.ink, &regions)?;
+        self.working.blend_regions(&self.overlay, &regions)?;
+        let damage =
+            tile_damage_regions(&self.presented, &self.working, self.damage_tile, &regions);
         if damage.is_empty() {
             return Ok(terminals);
         }
         let decision = self.refresh_policy.decide(
-            FrameIntent::Settled,
+            intent,
             ContentClass::TextUi,
             damage_pixels(&damage),
             u64::from(self.width()) * u64::from(self.height()),
@@ -328,10 +385,9 @@ impl DisplayCore {
         let damage =
             self.refresh_policy
                 .damage_for_decision(decision, self.width(), self.height(), damage);
-        let panel_metrics = panel.submit(&composed, &damage, decision)?;
+        let panel_metrics = panel.submit(&self.working, &damage, decision)?;
         self.record_panel_damage(decision, &damage, now);
-        self.presented = composed;
-        self.working.clone_from(&self.presented);
+        self.presented.copy_regions_from(&self.working, &damage)?;
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
         self.refresh_policy
@@ -619,8 +675,13 @@ impl DisplayCore {
         if pending.intent == FrameIntent::Settled {
             compose_regions.extend(self.settle_damage.iter().cloned());
         }
-        self.base
-            .compose_regions_into(&self.overlay, &mut self.working, &compose_regions)?;
+        if self.peer_overlay.is_transparent() && self.ink.is_transparent() {
+            self.base
+                .compose_regions_into(&self.overlay, &mut self.working, &compose_regions)?;
+        } else {
+            let composed = self.compose_base()?.into_owned();
+            composed.compose_regions_into(&self.overlay, &mut self.working, &compose_regions)?;
+        }
         let damage = if pending.force_full_damage {
             full_damage(self.width(), self.height())
         } else {
@@ -676,8 +737,8 @@ impl DisplayCore {
                 .damage_for_decision(decision, self.width(), self.height(), damage);
         if decision.complete_refresh {
             let full = full_damage(self.width(), self.height());
-            self.base
-                .compose_regions_into(&self.overlay, &mut self.working, &full)?;
+            let composed = self.compose_base()?.into_owned();
+            composed.compose_regions_into(&self.overlay, &mut self.working, &full)?;
             damage = full;
         }
         let compose_us = elapsed_us(compose_started);
@@ -703,6 +764,7 @@ impl DisplayCore {
         if damage.is_empty() {
             metrics.present_us = elapsed_us(present_started);
             self.presented_frame_id = pending.frame_id;
+            self.presented_base.clone_from(&self.base);
             self.last_present_at = Some(now);
             return Ok(vec![TerminalFrame {
                 frame_id: pending.frame_id,
@@ -732,6 +794,7 @@ impl DisplayCore {
         std::mem::swap(&mut self.presented, &mut self.working);
         self.working.copy_regions_from(&self.presented, &damage)?;
         self.presented_frame_id = pending.frame_id;
+        self.presented_base.clone_from(&self.base);
         self.last_present_at = Some(now);
         self.panel_state_uncertain = false;
         self.refresh_policy

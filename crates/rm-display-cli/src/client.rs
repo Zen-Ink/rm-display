@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use crate::events::write_event_jsonl;
 const MIN_MINOR: u32 = 0;
-const MAX_MINOR: u32 = 2;
+const MAX_MINOR: u32 = 3;
 const SURFACE_ID: u32 = 1;
 const MAX_DELTA_REGIONS: usize = 64;
 
@@ -184,6 +184,8 @@ impl ProducerClient {
                 ProtocolFeature::LatestSupersede as i32,
                 ProtocolFeature::SettledBarrier as i32,
                 ProtocolFeature::PointerInput as i32,
+                ProtocolFeature::RemoteOverlay as i32,
+                ProtocolFeature::LocalInk as i32,
                 ProtocolFeature::KeyInput as i32,
                 ProtocolFeature::TextInput as i32,
                 ProtocolFeature::Actions as i32,
@@ -522,6 +524,36 @@ impl ProducerClient {
         })
     }
 
+    /// Applies one negotiated overlay command and waits for its acknowledgement.
+    /// Callers provide strictly increasing sequence numbers and active surface IDs.
+    pub fn update_overlay(
+        &mut self,
+        update: rm_display_protocol::OverlayUpdate,
+    ) -> Result<rm_display_protocol::OverlayResult, ProducerError> {
+        if !self.server_hello.as_ref().is_some_and(|hello| {
+            hello
+                .features
+                .contains(&(ProtocolFeature::RemoteOverlay as i32))
+        }) {
+            return Err(ProducerError::BadHello("remote overlay unavailable"));
+        }
+        let releases_frozen_base = update.local_ink == Some(false);
+        let sequence = update.sequence;
+        self.send(envelope::Body::OverlayUpdate(update))?;
+        loop {
+            match self.receive()?.body {
+                Some(envelope::Body::OverlayResult(result)) if result.sequence == sequence => {
+                    if result.applied && releases_frozen_base {
+                        self.needs_keyframe = true;
+                    }
+                    return Ok(result);
+                }
+                Some(body) => self.handle_auxiliary(body)?,
+                None => return Err(ProducerError::UnexpectedMessage),
+            }
+        }
+    }
+
     pub fn send_frame(
         &mut self,
         surface: &Surface,
@@ -784,6 +816,9 @@ impl ProducerClient {
             let result = report.result;
             let code =
                 FrameResultCode::try_from(result.result).unwrap_or(FrameResultCode::Unspecified);
+            if result.reason == rm_display_protocol::FrameResultReason::InkFrozen as i32 {
+                return Ok(FrameReport { result, producer });
+            }
             match code {
                 FrameResultCode::Presented | FrameResultCode::Superseded => {
                     producer.total_us = elapsed_us(total_started);
@@ -1230,6 +1265,13 @@ fn validate_server_hello(server: &ServerHello) -> Result<(), ProducerError> {
             "v2.2 custom profile capability missing",
         ));
     }
+    if server.selected_minor >= 3
+        && !server
+            .features
+            .contains(&(ProtocolFeature::RemoteOverlay as i32))
+    {
+        return Err(ProducerError::BadHello("v2.3 remote overlay missing"));
+    }
     for mandatory in [
         ProtocolFeature::AtomicMultiRegion,
         ProtocolFeature::ExactBaseDelta,
@@ -1313,6 +1355,22 @@ mod tests {
         let raw = encode_region(rect, &pixels, false);
         assert_eq!(raw.encoding, Encoding::Raw as i32);
         assert_eq!(raw.data.as_ref(), pixels);
+    }
+
+    #[test]
+    fn v23_requires_the_remote_overlay_capability() {
+        let mut hello = server_hello();
+        hello.selected_minor = 3;
+        hello.features.extend([
+            ProtocolFeature::ByteCredits as i32,
+            ProtocolFeature::EpaperCustomProfile as i32,
+        ]);
+        assert!(matches!(
+            validate_server_hello(&hello),
+            Err(ProducerError::BadHello("v2.3 remote overlay missing"))
+        ));
+        hello.features.push(ProtocolFeature::RemoteOverlay as i32);
+        assert!(validate_server_hello(&hello).is_ok());
     }
 
     fn limits() -> Limits {

@@ -1,4 +1,4 @@
-# rm-display protocol v2.0 / v2.1 / v2.2
+# rm-display protocol v2.0 / v2.1 / v2.2 / v2.3
 
 Status: **frozen base semantics with negotiated, wire-compatible optional
 extensions** for the receiver, Android producer, and Linux CLI.
@@ -165,6 +165,13 @@ fields are portable semantic choices (`FASTEST`, `FAST`, or `QUALITY`) for
 LATEST text/mixed, LATEST photo, LATEST video, and SETTLED presentations. They
 are not native Quill constants. `FULL_QUALITY` is intentionally absent, and a
 producer still cannot request a partial or complete refresh directly.
+
+Protocol v2.3 requires `PROTOCOL_FEATURE_REMOTE_OVERLAY` in addition to the
+v2.2 requirements. It adds a producer-owned grayscale/alpha plane which is
+composed without changing the frame delta base. `PROTOCOL_FEATURE_LOCAL_INK`
+is optional and is advertised only when a pen is available; it binds the first
+pen DOWN to the exact presented frame and freezes that base until explicitly
+released. See [`overlay-and-pen.md`](overlay-and-pen.md).
 
 Optional capabilities are negotiated by intersection: the producer includes a
 feature in `ClientHello`, and the receiver echoes it in `ServerHello` only when
@@ -469,6 +476,8 @@ validators and share fixtures. Required tests include:
 - optional refresh-parameter presence, QUERY/UPDATE/CLEANUP validation,
   physical-update counting, and five-finger cancellation/suppression;
 - Rust/Kotlin decoding of the same checked-in protobuf fixtures.
+- negotiated/unnegotiated v2.3 overlay commands, sequence and bounds rejection,
+  exact presented-frame ink freeze, frozen-frame rejection, and keyframe resume.
 
 Protobuf serialization is not treated as a canonical signing format. Golden
 tests compare decoded messages and semantic behavior; exact bytes are asserted
@@ -491,6 +500,11 @@ v2.2 appends `EPAPER_CUSTOM_PROFILE`, `EPAPER_PROFILE_CUSTOM`, the stable
 continues to use the named-profile state fields. v2.2 does not weaken SETTLED:
 it remains a mandatory terminal barrier even when its configured waveform is
 Fast or Fastest.
+
+v2.3 appends `REMOTE_OVERLAY`, optional `LOCAL_INK`, overlay request/result
+messages, exact presented-frame metadata on input, and the `INK_FROZEN` frame
+reason. Older peers never negotiate these features and ignore the appended
+fields. Overlay pixels remain separate from the remote frame delta base.
 
 Assigning a previously reserved meaning without negotiation, changing an
 existing field type/number, or weakening atomic/base semantics requires a new

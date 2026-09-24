@@ -25,9 +25,9 @@ use crate::config::{ConfigError, ReceiverConfig};
 ))]
 use crate::evdev::discover_remarkable_touch_device;
 #[cfg(target_os = "linux")]
-use crate::evdev::EvdevTouchDevice;
-#[cfg(target_os = "linux")]
 use crate::evdev::PowerKeyDevice;
+#[cfg(target_os = "linux")]
+use crate::evdev::{EvdevPenDevice, EvdevTouchDevice};
 use crate::pairing::{pairing_uri, render_pairing_frame, PairingError};
 use crate::session::{Session, SessionError};
 
@@ -44,6 +44,8 @@ pub struct ReceiverServer {
     #[cfg(target_os = "linux")]
     input: Option<EvdevTouchDevice>,
     #[cfg(target_os = "linux")]
+    pen: Option<EvdevPenDevice>,
+    #[cfg(target_os = "linux")]
     power_key: Option<PowerKeyDevice>,
 }
 
@@ -58,6 +60,7 @@ enum IdleWait {
 struct IdleReady {
     listener: bool,
     touch: bool,
+    pen: bool,
     power: bool,
 }
 
@@ -65,6 +68,7 @@ struct IdleReady {
 fn poll_idle_sources(
     listener: &TcpListener,
     input: Option<&EvdevTouchDevice>,
+    pen: Option<&EvdevPenDevice>,
     power_key: Option<&PowerKeyDevice>,
 ) -> io::Result<IdleReady> {
     let mut descriptors = vec![libc::pollfd {
@@ -73,6 +77,15 @@ fn poll_idle_sources(
         revents: 0,
     }];
     let touch_index = input.map(|device| {
+        let index = descriptors.len();
+        descriptors.push(libc::pollfd {
+            fd: device.event_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
+        index
+    });
+    let pen_index = pen.map(|device| {
         let index = descriptors.len();
         descriptors.push(libc::pollfd {
             fd: device.event_fd(),
@@ -103,6 +116,11 @@ fn poll_idle_sources(
                 listener: descriptors[0].revents & libc::POLLIN != 0,
                 touch: touch_index
                     .is_some_and(|index| descriptors[index].revents & libc::POLLIN != 0),
+                pen: pen_index.is_some_and(|index| {
+                    descriptors[index].revents
+                        & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+                        != 0
+                }),
                 power: power_index
                     .is_some_and(|index| descriptors[index].revents & libc::POLLIN != 0),
             });
@@ -156,7 +174,9 @@ impl ReceiverServer {
         #[cfg(target_os = "linux")]
         let (power_key, power_status) = auto_open_power_key();
         #[cfg(target_os = "linux")]
-        let input_status = format!("{input_status}; {power_status}");
+        let (pen, pen_status) = open_pen(panel.as_ref());
+        #[cfg(target_os = "linux")]
+        let input_status = format!("{input_status}; {power_status}; {pen_status}");
         #[cfg(not(target_os = "linux"))]
         let input_status = {
             config.input_device = None;
@@ -174,6 +194,8 @@ impl ReceiverServer {
             input_status,
             #[cfg(target_os = "linux")]
             input,
+            #[cfg(target_os = "linux")]
+            pen,
             #[cfg(target_os = "linux")]
             power_key,
         })
@@ -268,13 +290,25 @@ impl ReceiverServer {
             Some(self.pairing_frame.clone()),
         );
         loop {
-            let ready =
-                poll_idle_sources(&self.listener, self.input.as_ref(), self.power_key.as_ref())?;
+            let ready = poll_idle_sources(
+                &self.listener,
+                self.input.as_ref(),
+                self.pen.as_ref(),
+                self.power_key.as_ref(),
+            )?;
             let now = started.elapsed();
             if ready.power {
                 if let Some(device) = self.power_key.as_ref() {
                     for _ in 0..device.drain_presses() {
                         let _ = idle.power_key_pressed(now)?;
+                    }
+                }
+            }
+            if ready.pen {
+                if let Some(device) = self.pen.as_mut() {
+                    if let Err(error) = device.drain_reports() {
+                        eprintln!("rm-display: pen input disabled: {error}");
+                        self.pen = None;
                     }
                 }
             }
@@ -334,7 +368,7 @@ impl ReceiverServer {
             let mut secured = psk.accept(stream)?;
             secured
                 .get_ref()
-                .set_read_timeout(Some(Duration::from_millis(20)))?;
+                .set_read_timeout(Some(Duration::from_millis(10)))?;
             return drive_connection(
                 &mut secured,
                 self.config.clone(),
@@ -343,11 +377,13 @@ impl ReceiverServer {
                 #[cfg(target_os = "linux")]
                 self.input.as_mut(),
                 #[cfg(target_os = "linux")]
+                &mut self.pen,
+                #[cfg(target_os = "linux")]
                 self.power_key.as_ref(),
             );
         }
         let mut plain = stream;
-        plain.set_read_timeout(Some(Duration::from_millis(20)))?;
+        plain.set_read_timeout(Some(Duration::from_millis(10)))?;
         drive_connection(
             &mut plain,
             self.config.clone(),
@@ -355,6 +391,8 @@ impl ReceiverServer {
             Some(self.pairing_frame.clone()),
             #[cfg(target_os = "linux")]
             self.input.as_mut(),
+            #[cfg(target_os = "linux")]
+            &mut self.pen,
             #[cfg(target_os = "linux")]
             self.power_key.as_ref(),
         )
@@ -434,16 +472,57 @@ fn auto_open_touch(_panel: &dyn PanelBackend) -> (Option<EvdevTouchDevice>, Stri
     )
 }
 
+#[cfg(target_os = "linux")]
+fn open_pen(panel: &dyn PanelBackend) -> (Option<EvdevPenDevice>, String) {
+    let info = panel.info();
+    let result = if let Some(path) = std::env::var_os("RM_DISPLAY_PEN_DEVICE") {
+        EvdevPenDevice::open(std::path::Path::new(&path), info.width, info.height)
+            .map_err(|e| e.to_string())
+    } else if cfg!(all(
+        feature = "quill",
+        any(target_arch = "aarch64", target_arch = "arm")
+    )) {
+        EvdevPenDevice::discover_open(info.width, info.height)
+    } else {
+        Err("automatic discovery is limited to reMarkable Quill builds".into())
+    };
+    match result {
+        Ok(device) => {
+            let status = format!(
+                "pen input enabled: {} ({:?})",
+                device.path().display(),
+                device.name()
+            );
+            (Some(device), status)
+        }
+        Err(reason) => (None, format!("pen input disabled: {reason}")),
+    }
+}
+
 fn drive_connection<T: Read + Write>(
     stream: &mut T,
     config: ReceiverConfig,
     panel: &mut dyn PanelBackend,
     fallback: Option<GraySurface>,
     #[cfg(target_os = "linux")] input_device: Option<&mut EvdevTouchDevice>,
+    #[cfg(target_os = "linux")] pen: &mut Option<EvdevPenDevice>,
     #[cfg(target_os = "linux")] power_key: Option<&PowerKeyDevice>,
 ) -> Result<(), ServerError> {
     let started = Instant::now();
     let mut session = Session::new_with_fallback(config.clone(), panel, fallback);
+    #[cfg(target_os = "linux")]
+    {
+        // Discard queued events and the previous producer's contact on reconnect.
+        if let Some(device) = pen.as_mut() {
+            if let Err(error) = device.drain_reports() {
+                eprintln!("rm-display: pen input disabled: {error}");
+                *pen = None;
+            } else {
+                device.cancel();
+            }
+        }
+        session.set_pen_available(pen.is_some());
+    }
     let mut codec = WireCodec::pre_handshake();
     let mut input = BytesMut::with_capacity(64 * 1024);
     let mut read_buffer = [0_u8; 64 * 1024];
@@ -452,13 +531,28 @@ fn drive_connection<T: Read + Write>(
 
     loop {
         let now = started.elapsed();
-        write_envelopes(stream, &codec, session.poll(now)?)?;
         #[cfg(target_os = "linux")]
         if let Some(device) = input_device.as_deref_mut() {
             let reports = device.drain_reports()?;
             let envelopes = session.input_reports(reports, now)?;
             write_envelopes(stream, &codec, envelopes)?;
         }
+        #[cfg(target_os = "linux")]
+        if let Some(device) = pen.as_mut() {
+            match device.drain_reports() {
+                Ok(reports) => write_envelopes(stream, &codec, session.pen_reports(reports, now)?)?,
+                Err(error) => {
+                    let cancelled = device.cancel();
+                    eprintln!("rm-display: pen input disabled: {error}");
+                    *pen = None;
+                    let envelopes = session.pen_reports(vec![cancelled], now)?;
+                    session.set_pen_available(false);
+                    write_envelopes(stream, &codec, envelopes)?;
+                }
+            }
+        }
+        // Process queued pen DOWN before presenting a newer pending base.
+        write_envelopes(stream, &codec, session.poll(now)?)?;
         #[cfg(target_os = "linux")]
         if let Some(device) = power_key {
             for _ in 0..device.drain_presses() {

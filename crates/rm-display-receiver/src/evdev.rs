@@ -1082,6 +1082,380 @@ impl Drop for EvdevTouchDevice {
     }
 }
 
+/// Capability-discovered, nonblocking stylus. Coordinates are physical panel 16.16.
+#[cfg(target_os = "linux")]
+pub struct EvdevPenDevice {
+    fd: RawFd,
+    path: PathBuf,
+    name: String,
+    axes: [AxisRange; 3],
+    tilt: [Option<AxisRange>; 2],
+    size: [u32; 2],
+    rm2_transform: bool,
+    raw: [i32; 5],
+    pen: bool,
+    eraser: bool,
+    buttons: u32,
+    dirty: bool,
+    dropped: bool,
+    last: Option<rm_display_protocol::PointerRecord>,
+}
+
+#[cfg(target_os = "linux")]
+impl EvdevPenDevice {
+    pub fn discover_open(width: u32, height: u32) -> Result<Self, String> {
+        let machine = std::fs::read_to_string("/sys/devices/soc0/machine")
+            .map_err(|error| format!("cannot identify reMarkable hardware: {error}"))?;
+        if !is_remarkable_machine(&machine) {
+            return Err("automatic pen discovery is limited to reMarkable hardware".into());
+        }
+        let mut candidates = Vec::new();
+        for entry in std::fs::read_dir("/dev/input").map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if !path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.starts_with("event"))
+            {
+                continue;
+            }
+            if let Ok(fd) = open_event_node(&path) {
+                if Self::supported(fd) {
+                    candidates.push(path);
+                }
+                unsafe { libc::close(fd) };
+            }
+        }
+        if candidates.len() != 1 {
+            return Err(format!(
+                "expected one pen with valid X/Y/pressure and tool capabilities, found {}",
+                candidates.len()
+            ));
+        }
+        Self::open(&candidates[0], width, height).map_err(|e| e.to_string())
+    }
+
+    fn supported(fd: RawFd) -> bool {
+        let mut keys = [0_u8; 96];
+        (unsafe { libc::ioctl(fd, EVIOCGBIT_KEY_96, keys.as_mut_ptr()) }) >= 0
+            && [320_usize, 321]
+                .iter()
+                .any(|code| keys[code / 8] & (1 << (code % 8)) != 0)
+            && [0, 1, 24]
+                .iter()
+                .all(|code| query_axis_range(fd, 0x8018_4540 + code).is_some())
+    }
+
+    pub fn open(path: &Path, width: u32, height: u32) -> io::Result<Self> {
+        let fd = open_event_node(path)?;
+        let result = (|| {
+            if !Self::supported(fd) || width == 0 || height == 0 || width > 65536 || height > 65536
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid pen capabilities or panel size",
+                ));
+            }
+            let name = query_device_name(fd);
+            let mut axes = [0, 1, 24].map(|code| query_axis_range(fd, 0x8018_4540 + code).unwrap());
+            // Calibration is in raw digitizer units: xmin,xmax,ymin,ymax.
+            if let Ok(value) = std::env::var("RM_DISPLAY_PEN_BOUNDS") {
+                let bounds = value
+                    .split(',')
+                    .map(str::parse::<i32>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "invalid RM_DISPLAY_PEN_BOUNDS")
+                    })?;
+                if bounds.len() != 4 || bounds[0] >= bounds[1] || bounds[2] >= bounds[3] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RM_DISPLAY_PEN_BOUNDS requires xmin,xmax,ymin,ymax",
+                    ));
+                }
+                axes[0] = AxisRange {
+                    minimum: bounds[0],
+                    maximum: bounds[1],
+                };
+                axes[1] = AxisRange {
+                    minimum: bounds[2],
+                    maximum: bounds[3],
+                };
+            }
+            // RM2 portrait: x=raw_y, y=max_raw_x-raw_x. Paper Pro is identity.
+            let rm2_transform = match std::env::var("RM_DISPLAY_PEN_TRANSFORM").as_deref() {
+                Ok("rm2") => true,
+                Ok("identity") => false,
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RM_DISPLAY_PEN_TRANSFORM must be rm2 or identity",
+                    ))
+                }
+                Err(_) => name.eq_ignore_ascii_case("Wacom I2C Digitizer"),
+            };
+            if unsafe { libc::ioctl(fd, EVIOCGRAB, 1_i32) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self {
+                fd,
+                path: path.to_path_buf(),
+                name,
+                axes,
+                tilt: [26, 27].map(|code| query_axis_range(fd, 0x8018_4540 + code)),
+                size: [width, height],
+                rm2_transform,
+                raw: [0, 1, 24, 26, 27].map(|code| {
+                    let mut info = InputAbsInfo::default();
+                    unsafe {
+                        libc::ioctl(
+                            fd,
+                            0x8018_4540 as libc::c_ulong + code as libc::c_ulong,
+                            &mut info,
+                        )
+                    };
+                    info.value
+                }),
+                pen: false,
+                eraser: false,
+                buttons: 0,
+                dirty: false,
+                dropped: false,
+                last: None,
+            })
+        })();
+        if result.is_err() {
+            unsafe { libc::close(fd) };
+        }
+        result
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub(crate) fn event_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    pub fn cancel(&mut self) -> Vec<rm_display_protocol::PointerRecord> {
+        self.last
+            .take()
+            .map(|mut record| {
+                record.phase = rm_display_protocol::PointerPhase::Cancel as i32;
+                record.pressure = 0;
+                record.buttons = 0;
+                record
+            })
+            .into_iter()
+            .collect()
+    }
+
+    fn report(&mut self) -> Vec<rm_display_protocol::PointerRecord> {
+        use rm_display_protocol::{PointerDevice, PointerPhase, PointerRecord};
+        self.dirty = false;
+        if !self.pen && !self.eraser {
+            return self.cancel();
+        }
+        let scaled = |raw: i32, range: AxisRange, maximum: u32| -> u32 {
+            ((i64::from(raw.clamp(range.minimum, range.maximum)) - i64::from(range.minimum)) as u64
+                * u64::from(maximum)
+                / (i64::from(range.maximum) - i64::from(range.minimum)) as u64) as u32
+        };
+        let (xi, yi) = if self.rm2_transform { (1, 0) } else { (0, 1) };
+        let x = scaled(self.raw[xi], self.axes[xi], (self.size[0] - 1) << 16);
+        let mut y = scaled(self.raw[yi], self.axes[yi], (self.size[1] - 1) << 16);
+        if self.rm2_transform {
+            y = ((self.size[1] - 1) << 16) - y;
+        }
+        let touching = self.buttons & 1 != 0;
+        let was_touching = self.last.as_ref().is_some_and(|r| r.buttons & 1 != 0);
+        let phase = match (touching, was_touching) {
+            (true, false) => PointerPhase::Down,
+            (true, true) => PointerPhase::Move,
+            (false, true) => PointerPhase::Up,
+            (false, false) => PointerPhase::Hover,
+        };
+        let mut tilt = [0_i32; 2];
+        for (index, range) in self.tilt.iter().enumerate() {
+            if let Some(range) = range {
+                // Linux tilt is usually -64..63; normalize each side around zero.
+                let value = i64::from(self.raw[index + 3].clamp(range.minimum, range.maximum));
+                let extent = if value < 0 {
+                    -i64::from(range.minimum)
+                } else {
+                    i64::from(range.maximum)
+                };
+                if extent > 0 {
+                    tilt[index] = (value * 90 / extent).clamp(-90, 90) as i32;
+                }
+            }
+        }
+        if self.rm2_transform {
+            tilt = [tilt[1], -tilt[0]];
+        }
+        let record = PointerRecord {
+            device: PointerDevice::Pen as i32,
+            phase: phase as i32,
+            flags: u32::from(self.eraser),
+            contact_id: 1,
+            x_16_16: x,
+            y_16_16: y,
+            pressure: if touching {
+                scaled(self.raw[2], self.axes[2], 65535)
+            } else {
+                0
+            },
+            buttons: self.buttons,
+            tilt_x: tilt[0],
+            tilt_y: tilt[1],
+        };
+        let mut output = Vec::new();
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|old| old.flags != record.flags)
+        {
+            output.extend(self.cancel());
+        }
+        let mut record = record;
+        if touching && self.last.is_none() {
+            record.phase = PointerPhase::Down as i32;
+        }
+        self.last = Some(record.clone());
+        output.push(record);
+        output
+    }
+
+    pub fn drain_reports(&mut self) -> io::Result<Vec<Vec<rm_display_protocol::PointerRecord>>> {
+        let mut reports = Vec::new();
+        let mut buffer = [0_u8; 24 * 64];
+        let size = kernel_input_event_size();
+        loop {
+            let count = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    break;
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if count == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pen disconnected",
+                ));
+            }
+            if count as usize % size != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unaligned pen input_event",
+                ));
+            }
+            for bytes in buffer[..count as usize].chunks_exact(size) {
+                let event = decode_kernel_input_event(bytes).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid pen input_event")
+                })?;
+                if event.event_type == EV_SYN && event.code == SYN_DROPPED {
+                    let cancelled = self.cancel();
+                    if !cancelled.is_empty() {
+                        reports.push(cancelled);
+                    }
+                    self.dropped = true;
+                    continue;
+                }
+                if self.dropped {
+                    if event.event_type == EV_SYN && event.code == SYN_REPORT {
+                        // Kernel state is authoritative after overflow; never replay stale contact state.
+                        let mut keys = [0_u8; 96];
+                        if unsafe {
+                            libc::ioctl(self.fd, 0x8060_4518 as libc::c_ulong, keys.as_mut_ptr())
+                        } < 0
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        let key = |code: usize| keys[code / 8] & (1 << (code % 8)) != 0;
+                        self.pen = key(320);
+                        self.eraser = key(321);
+                        self.buttons = u32::from(key(330))
+                            | (u32::from(key(331)) << 1)
+                            | (u32::from(key(332)) << 2);
+                        for (index, code) in [0, 1, 24, 26, 27].iter().enumerate() {
+                            let mut info = InputAbsInfo::default();
+                            if unsafe {
+                                libc::ioctl(
+                                    self.fd,
+                                    0x8018_4540 as libc::c_ulong + *code as libc::c_ulong,
+                                    &mut info,
+                                )
+                            } == 0
+                            {
+                                self.raw[index] = info.value;
+                            }
+                        }
+                        self.dropped = false;
+                        self.dirty = true;
+                    }
+                    continue;
+                }
+                match (event.event_type, event.code) {
+                    (EV_ABS, code @ (0 | 1 | 24 | 26 | 27)) => {
+                        let index = match code {
+                            0 => 0,
+                            1 => 1,
+                            24 => 2,
+                            26 => 3,
+                            _ => 4,
+                        };
+                        self.raw[index] = event.value;
+                        self.dirty = true;
+                    }
+                    (EV_KEY, 320) => {
+                        self.pen = event.value != 0;
+                        self.dirty = true;
+                    }
+                    (EV_KEY, 321) => {
+                        self.eraser = event.value != 0;
+                        self.dirty = true;
+                    }
+                    (EV_KEY, code @ (330..=332)) => {
+                        let bit = 1 << (code - 330);
+                        if event.value != 0 {
+                            self.buttons |= bit;
+                        } else {
+                            self.buttons &= !bit;
+                        }
+                        self.dirty = true;
+                    }
+                    (EV_SYN, SYN_REPORT) if self.dirty => {
+                        let report = self.report();
+                        if !report.is_empty() {
+                            reports.push(report);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(reports)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EvdevPenDevice {
+    fn drop(&mut self) {
+        unsafe {
+            libc::ioctl(self.fd, EVIOCGRAB, 0_i32);
+            libc::close(self.fd);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

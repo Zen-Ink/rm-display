@@ -24,7 +24,7 @@ use crate::config::ReceiverConfig;
 use crate::evdev::{FiveFingerCleanupGesture, PhysicalPointerEvent, PointerPhase as PhysicalPhase};
 use crate::local_menu::{LocalMenu, LocalMenuAction};
 
-const MAX_MINOR: u32 = 2;
+const MAX_MINOR: u32 = 3;
 
 const MANDATORY_FEATURES: [ProtocolFeature; 4] = [
     ProtocolFeature::AtomicMultiRegion,
@@ -37,6 +37,10 @@ struct ActiveSurface {
     surface_id: u32,
     generation: u32,
     touch_enabled: bool,
+    pen_enabled: bool,
+    local_ink: bool,
+    ink_frozen: bool,
+    pen_point: Option<(u32, u32)>,
     core: DisplayCore,
 }
 
@@ -63,6 +67,10 @@ pub struct Session<'a> {
     custom_profile_control_enabled: bool,
     refresh_control_enabled: bool,
     selected_minor: u32,
+    pen_available: bool,
+    remote_overlay_enabled: bool,
+    local_ink_enabled: bool,
+    overlay_sequence: u64,
     negotiated_encodings: Vec<i32>,
     color_rgb565_enabled: bool,
     byte_credits_enabled: bool,
@@ -108,6 +116,10 @@ impl<'a> Session<'a> {
             custom_profile_control_enabled: false,
             refresh_control_enabled: false,
             selected_minor: 0,
+            pen_available: false,
+            remote_overlay_enabled: false,
+            local_ink_enabled: false,
+            overlay_sequence: 0,
             negotiated_encodings: Vec::new(),
             color_rgb565_enabled: false,
             byte_credits_enabled: false,
@@ -119,6 +131,199 @@ impl<'a> Session<'a> {
             surface: None,
             fallback,
         }
+    }
+
+    pub fn set_pen_available(&mut self, available: bool) {
+        self.pen_available = available;
+        if !available {
+            if let Some(surface) = self.surface.as_mut() {
+                surface.pen_enabled = false;
+                surface.pen_point = None;
+            }
+        }
+    }
+
+    fn input_capabilities(&self, touch: bool, pen: bool) -> Vec<i32> {
+        let mut caps = Vec::new();
+        if touch {
+            caps.push(InputCapability::Touch as i32);
+        }
+        if pen {
+            caps.push(InputCapability::Pen as i32);
+        }
+        caps
+    }
+
+    pub fn pen_reports(
+        &mut self,
+        reports: Vec<Vec<PointerRecord>>,
+        now: Duration,
+    ) -> Result<Vec<Envelope>, SessionError> {
+        let mut responses = Vec::new();
+        for records in reports {
+            let Some(surface) = self.surface.as_mut() else {
+                continue;
+            };
+            if !surface.pen_enabled || self.local_menu.is_visible() {
+                surface.pen_point = None;
+                continue;
+            }
+            let mut terminals = Vec::new();
+            for record in &records {
+                let phase = PointerPhase::try_from(record.phase).unwrap_or(PointerPhase::Cancel);
+                if surface.local_ink
+                    && phase == PointerPhase::Down
+                    && !surface.ink_frozen
+                    && surface.core.presented_frame_id() != 0
+                {
+                    surface.ink_frozen = true;
+                    terminals.extend(surface.core.freeze_presented());
+                }
+                if surface.local_ink
+                    && surface.ink_frozen
+                    && matches!(phase, PointerPhase::Down | PointerPhase::Move)
+                {
+                    let point = (
+                        (record.x_16_16 >> 16).min(surface.core.width() - 1),
+                        (record.y_16_16 >> 16).min(surface.core.height() - 1),
+                    );
+                    let previous = surface.pen_point.unwrap_or(point);
+                    let width = surface.core.width();
+                    let erase = record.flags & 1 != 0;
+                    surface.core.ink_mut().ink_line(
+                        width,
+                        previous,
+                        point,
+                        if erase { 12 } else { 2 },
+                        erase,
+                    );
+                    surface.pen_point = Some(point);
+                } else {
+                    surface.pen_point = None;
+                }
+            }
+
+            let batch = rm_display_protocol::InputBatch {
+                surface_id: surface.surface_id,
+                generation: surface.generation,
+                sequence: self.next_input_sequence,
+                monotonic_us: now.as_micros().min(u64::MAX as u128) as u64,
+                records,
+                presented_frame_id: surface.core.presented_frame_id(),
+                ink_frozen: surface.ink_frozen,
+            };
+            self.next_input_sequence = self.next_input_sequence.wrapping_add(1).max(1);
+            responses.push(self.wrap(Body::InputBatch(batch)));
+            responses.extend(
+                terminals
+                    .into_iter()
+                    .map(|terminal| self.terminal_result(terminal)),
+            );
+        }
+        if let Some(surface) = self.surface.as_mut() {
+            if surface.local_ink && surface.ink_frozen {
+                let terminals = surface.core.present_ink(now, self.panel)?;
+                responses.extend(
+                    terminals
+                        .into_iter()
+                        .map(|terminal| self.terminal_result(terminal)),
+                );
+            }
+        }
+        Ok(responses)
+    }
+
+    fn overlay_update(
+        &mut self,
+        update: rm_display_protocol::OverlayUpdate,
+        now: Duration,
+    ) -> Result<Vec<Envelope>, SessionError> {
+        let mut result = rm_display_protocol::OverlayResult {
+            surface_id: update.surface_id,
+            generation: update.generation,
+            sequence: update.sequence,
+            applied: false,
+            message: String::new(),
+            presented_frame_id: 0,
+            ink_frozen: false,
+        };
+        let valid_sequence = update.sequence != 0 && update.sequence > self.overlay_sequence;
+        if valid_sequence {
+            self.overlay_sequence = update.sequence;
+        }
+        let mut terminals = Vec::new();
+        let problem = if !self.remote_overlay_enabled {
+            Some("remote overlay was not negotiated")
+        } else if !valid_sequence {
+            Some("overlay sequence must increase")
+        } else if update.local_ink.is_some() && !self.local_ink_enabled {
+            Some("local ink was not negotiated")
+        } else if let Some(surface) = self.surface.as_mut() {
+            result.presented_frame_id = surface.core.presented_frame_id();
+            result.ink_frozen = surface.ink_frozen;
+            let width = surface.core.width();
+            let height = surface.core.height();
+            let valid_rect = update.rect.as_ref().is_some_and(|r| {
+                r.width > 0
+                    && r.height > 0
+                    && r.x.checked_add(r.width).is_some_and(|x| x <= width)
+                    && r.y.checked_add(r.height).is_some_and(|y| y <= height)
+                    && r.width as u64 * r.height as u64 == update.luma.len() as u64
+                    && update.luma.len() == update.alpha.len()
+            });
+            if surface.surface_id != update.surface_id || surface.generation != update.generation {
+                Some("wrong surface or generation")
+            } else if update.luma.len().saturating_add(update.alpha.len())
+                > self.config.limits.max_frame_bytes as usize
+            {
+                Some("overlay exceeds decoded byte limit")
+            } else if !(valid_rect
+                || update.rect.is_none()
+                    && update.luma.is_empty()
+                    && update.alpha.is_empty()
+                    && (update.clear || update.local_ink.is_some()))
+            {
+                Some("invalid overlay rectangle or payload")
+            } else {
+                if update.clear {
+                    surface.core.peer_overlay_mut().clear();
+                    surface.core.ink_mut().clear();
+                    surface.pen_point = None;
+                }
+                if let Some(rect) = &update.rect {
+                    surface.core.peer_overlay_mut().patch(
+                        width,
+                        rect,
+                        &update.luma,
+                        &update.alpha,
+                    )?;
+                }
+                if let Some(enabled) = update.local_ink {
+                    surface.local_ink = enabled;
+                    if !enabled {
+                        surface.ink_frozen = false;
+                        surface.pen_point = None;
+                        surface.core.ink_mut().clear();
+                    }
+                }
+                terminals = surface.core.present_overlay(now, self.panel)?;
+                result.applied = true;
+                result.presented_frame_id = surface.core.presented_frame_id();
+                result.ink_frozen = surface.ink_frozen;
+                None
+            }
+        } else {
+            Some("no active surface")
+        };
+        if let Some(problem) = problem {
+            result.message = problem.into();
+        }
+        let mut responses: Vec<_> = terminals
+            .into_iter()
+            .map(|terminal| self.terminal_result(terminal))
+            .collect();
+        responses.push(self.wrap(Body::OverlayResult(result)));
+        Ok(responses)
     }
 
     pub fn is_established(&self) -> bool {
@@ -198,6 +403,8 @@ impl<'a> Session<'a> {
                 }
                 Body::SurfaceOpen(open) => self.open_surface(open)?,
                 Body::SurfaceClose(close) => self.close_surface(close.surface_id, close.generation),
+                Body::OverlayUpdate(update) => self.overlay_update(update, now)?,
+                Body::OverlayResult(_) => return Err(SessionError::IllegalDirection),
                 Body::Frame(frame) => self.accept_frame(frame, now),
                 Body::EpaperProfileRequest(request) => self.handle_epaper_profile(request, now)?,
                 Body::EpaperRefreshRequest(request) => self.handle_epaper_refresh(request, now)?,
@@ -430,6 +637,11 @@ impl<'a> Session<'a> {
             sequence,
             monotonic_us: monotonic.as_micros().min(u64::MAX as u128) as u64,
             records: report.into_iter().map(pointer_record).collect(),
+            presented_frame_id: self
+                .surface
+                .as_ref()
+                .map_or(0, |s| s.core.presented_frame_id()),
+            ink_frozen: self.surface.as_ref().is_some_and(|s| s.ink_frozen),
         }))
     }
 
@@ -518,6 +730,13 @@ impl<'a> Session<'a> {
     fn accept_hello(&mut self, hello: ClientHello) -> Result<Envelope, SessionError> {
         validate_hello(&hello, &self.config)?;
         self.selected_minor = select_minor(&hello)?;
+        self.remote_overlay_enabled = self.selected_minor >= 3
+            && hello
+                .features
+                .contains(&(ProtocolFeature::RemoteOverlay as i32));
+        self.local_ink_enabled = self.remote_overlay_enabled
+            && self.pen_available
+            && hello.features.contains(&(ProtocolFeature::LocalInk as i32));
         self.byte_credits_enabled = self.selected_minor >= 1;
         self.profile_control_enabled = hello
             .features
@@ -550,7 +769,13 @@ impl<'a> Session<'a> {
             .copied()
             .map(|feature| feature as i32)
             .collect::<Vec<_>>();
-        if self.config.input_device.is_some() {
+        if self.remote_overlay_enabled {
+            features.push(ProtocolFeature::RemoteOverlay as i32);
+        }
+        if self.local_ink_enabled {
+            features.push(ProtocolFeature::LocalInk as i32);
+        }
+        if self.config.input_device.is_some() || self.pen_available {
             features.push(ProtocolFeature::PointerInput as i32);
         }
         if self.profile_control_enabled {
@@ -582,11 +807,8 @@ impl<'a> Session<'a> {
                 orientation: Orientation::Current as i32,
                 pixel_formats,
                 encodings: self.negotiated_encodings.clone(),
-                input_capabilities: if self.config.input_device.is_some() {
-                    vec![InputCapability::Touch as i32]
-                } else {
-                    Vec::new()
-                },
+                input_capabilities: self
+                    .input_capabilities(self.config.input_device.is_some(), self.pen_available),
             }),
             limits: Some(self.protocol_limits()),
             name: self.config.name.clone(),
@@ -649,10 +871,18 @@ impl<'a> Session<'a> {
             .collect::<Vec<_>>();
         self.touch_gesture.surface_transition();
         self.local_menu.close();
+        let pen_enabled = self.pen_available
+            && open
+                .input_capabilities
+                .contains(&(InputCapability::Pen as i32));
         self.surface = Some(ActiveSurface {
             surface_id: open.surface_id,
             generation,
             touch_enabled,
+            pen_enabled,
+            local_ink: false,
+            ink_frozen: false,
+            pen_point: None,
             core,
         });
         let ready = SurfaceReady {
@@ -663,11 +893,7 @@ impl<'a> Session<'a> {
             pixel_format: pixel_format as i32,
             orientation: Orientation::Current as i32,
             source_kind: source_kind as i32,
-            input_capabilities: if touch_enabled {
-                vec![InputCapability::Touch as i32]
-            } else {
-                Vec::new()
-            },
+            input_capabilities: self.input_capabilities(touch_enabled, pen_enabled),
             action_capabilities: Vec::new(),
             limits: Some(self.protocol_limits()),
         };
@@ -1107,6 +1333,17 @@ impl<'a> Session<'a> {
     }
 
     fn accept_frame(&mut self, frame: Frame, now: Duration) -> Vec<Envelope> {
+        if self
+            .surface
+            .as_ref()
+            .is_some_and(|surface| surface.ink_frozen)
+        {
+            return vec![self.immediate_frame_result(
+                &frame,
+                FrameResultCode::Rejected,
+                FrameResultReason::InkFrozen,
+            )];
+        }
         if frame
             .regions
             .iter()
@@ -1215,9 +1452,14 @@ impl<'a> Session<'a> {
             PresentationOutcome::Superseded => {
                 (FrameResultCode::Superseded, FrameResultReason::None)
             }
-            PresentationOutcome::Cancelled => {
-                (FrameResultCode::Rejected, FrameResultReason::ProtocolState)
-            }
+            PresentationOutcome::Cancelled => (
+                FrameResultCode::Rejected,
+                if self.surface.as_ref().is_some_and(|s| s.ink_frozen) {
+                    FrameResultReason::InkFrozen
+                } else {
+                    FrameResultReason::ProtocolState
+                },
+            ),
             PresentationOutcome::BackendFailure => {
                 (FrameResultCode::Rejected, FrameResultReason::BackendFailure)
             }
@@ -1532,6 +1774,18 @@ fn validate_hello(hello: &ClientHello, config: &ReceiverConfig) -> Result<(), Se
 }
 
 fn select_minor(hello: &ClientHello) -> Result<u32, SessionError> {
+    if hello.max_minor >= 3
+        && hello.min_minor <= 3
+        && [
+            ProtocolFeature::ByteCredits,
+            ProtocolFeature::EpaperCustomProfile,
+            ProtocolFeature::RemoteOverlay,
+        ]
+        .iter()
+        .all(|feature| hello.features.contains(&(*feature as i32)))
+    {
+        return Ok(3);
+    }
     if hello.max_minor >= 2
         && hello.min_minor <= 2
         && hello
