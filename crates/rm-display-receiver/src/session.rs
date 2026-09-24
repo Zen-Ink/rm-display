@@ -63,6 +63,7 @@ pub struct Session<'a> {
     next_outgoing_message_id: u32,
     next_generation: u32,
     next_input_sequence: u64,
+    input_not_before: Duration,
     last_profile_request_id: u32,
     last_refresh_request_id: u32,
     profile_control_enabled: bool,
@@ -114,6 +115,7 @@ impl<'a> Session<'a> {
             next_outgoing_message_id: 1,
             next_generation: 1,
             next_input_sequence: 1,
+            input_not_before: Duration::ZERO,
             last_profile_request_id: 0,
             last_refresh_request_id: 0,
             profile_control_enabled: false,
@@ -178,10 +180,13 @@ impl<'a> Session<'a> {
         let mut responses = Vec::new();
         for records in reports {
             if physical && !records.is_empty() {
-                self.last_interaction = now;
+                self.last_interaction = self.last_interaction.max(now);
                 for record in &records {
                     self.physical_pen_in_proximity = record.phase != PointerPhase::Cancel as i32;
                 }
+            }
+            if physical && now < self.input_not_before {
+                continue;
             }
             let Some(surface) = self.surface.as_mut() else {
                 continue;
@@ -334,6 +339,10 @@ impl<'a> Session<'a> {
             {
                 Some("invalid overlay rectangle or payload")
             } else {
+                if update.clear || update.local_ink.is_some() {
+                    self.input_not_before = now;
+                    surface.pen_needs_down = true;
+                }
                 if update.clear {
                     surface.core.peer_overlay_mut().clear();
                     surface.core.ink_mut().clear();
@@ -450,7 +459,11 @@ impl<'a> Session<'a> {
                     self.closed = true;
                     Vec::new()
                 }
-                Body::SurfaceOpen(open) => self.open_surface(open)?,
+                Body::SurfaceOpen(open) => {
+                    let responses = self.open_surface(open)?;
+                    self.input_not_before = now;
+                    responses
+                }
                 Body::SurfaceClose(close) => self.close_surface(close.surface_id, close.generation),
                 Body::OverlayUpdate(update) => self.overlay_update(update, now)?,
                 Body::OverlayResult(_) => return Err(SessionError::IllegalDirection),
@@ -529,7 +542,26 @@ impl<'a> Session<'a> {
         });
         let mut envelopes = Vec::new();
         for report in reports.into_iter().filter(|report| !report.is_empty()) {
-            self.last_interaction = monotonic;
+            self.last_interaction = self.last_interaction.max(monotonic);
+            if monotonic < self.input_not_before {
+                // Keep held-contact state, but never replay a previous page's input.
+                let mut cancelled = self
+                    .touch_gesture
+                    .process(report, false, false)
+                    .cancel_forwarded;
+                cancelled.extend(self.touch_gesture.surface_transition());
+                if let Some((surface_id, generation, _)) = surface {
+                    if !cancelled.is_empty() {
+                        envelopes.push(self.pointer_batch(
+                            surface_id,
+                            generation,
+                            cancelled,
+                            self.input_not_before,
+                        ));
+                    }
+                }
+                continue;
+            }
             if self.local_menu.is_visible() {
                 // Keep physical releases current while menu consumes the contacts.
                 self.touch_gesture.process(report.clone(), false, false);
@@ -579,6 +611,31 @@ impl<'a> Session<'a> {
             }
         }
         Ok(envelopes)
+    }
+
+    /// Cancel physical contacts after capture failure without clearing local ink.
+    pub fn input_capture_failed(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {
+        let cancelled = self.touch_gesture.surface_transition();
+        self.touch_gesture = FiveFingerCleanupGesture::default();
+        self.physical_pen_in_proximity = false;
+        let mut responses = Vec::new();
+        if let Some(surface) = self.surface.as_mut() {
+            let ids = (surface.surface_id, surface.generation);
+            let pen = surface.last_pen.clone().map(|mut pen| {
+                pen.phase = PointerPhase::Cancel as i32;
+                pen.pressure = 0;
+                pen.buttons = 0;
+                pen
+            });
+            if !cancelled.is_empty() {
+                responses.push(self.pointer_batch(ids.0, ids.1, cancelled, now));
+            }
+            if let Some(pen) = pen {
+                responses.extend(self.pen_reports_inner(vec![vec![pen]], now, true)?);
+            }
+        }
+        self.set_pen_available(false);
+        Ok(responses)
     }
 
     pub fn power_key_pressed(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {

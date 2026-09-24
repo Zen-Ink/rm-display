@@ -46,9 +46,10 @@ paused while a physical touch remains down, the pen remains in proximity, or
 for five seconds after physical input. Each refresh profile keeps its existing
 damage and panel-idle thresholds; explicit receiver cleanup/menu actions remain
 available. `RM_DISPLAY_INK_WAVEFORM=fastest|fast|quality`
-selects a hardware calibration override (default `fastest`). Connected input
-polls evdev and the socket together, drains pen before touch/network processing,
-and handles buffered TLS data without waiting for another socket wakeup.
+selects a hardware calibration override (default `fastest`). A bounded reader
+captures timestamped evdev reports independently of panel and network stalls;
+the connection loop drains them before network processing and handles buffered
+TLS data without waiting for another socket wakeup.
 Pen width is
 currently 5 physical pixels and eraser diameter 25. Pressure is forwarded but
 does not currently change local pen width. Menu entry sends CANCEL for previously forwarded touch contacts and the last

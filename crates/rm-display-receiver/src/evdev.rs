@@ -204,6 +204,32 @@ fn decode_kernel_input_event(bytes: &[u8]) -> Option<LinuxInputEvent> {
     })
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn monotonic_now() -> std::time::Duration {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    std::time::Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+#[cfg(target_os = "linux")]
+fn event_time(bytes: &[u8]) -> std::time::Duration {
+    let time = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<libc::timeval>()) };
+    std::time::Duration::from_secs(time.tv_sec.max(0) as u64)
+        + std::time::Duration::from_micros(time.tv_usec.max(0) as u64)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn use_monotonic_clock(fd: RawFd) -> io::Result<()> {
+    let clock = libc::CLOCK_MONOTONIC;
+    if unsafe { libc::ioctl(fd, 0x4004_45a0 as libc::c_ulong, &clock) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointerPhase {
     Down,
@@ -1047,10 +1073,33 @@ impl EvdevTouchDevice {
     }
 
     pub fn drain_reports(&mut self) -> io::Result<Vec<Vec<PhysicalPointerEvent>>> {
+        Ok(self
+            .drain_timed_reports()?
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect())
+    }
+
+    pub(crate) fn reset_contacts(&mut self) {
+        self.parser.push(LinuxInputEvent {
+            event_type: EV_SYN,
+            code: SYN_DROPPED,
+            value: 0,
+        });
+        self.parser.push(LinuxInputEvent {
+            event_type: EV_SYN,
+            code: SYN_REPORT,
+            value: 0,
+        });
+    }
+
+    pub(crate) fn drain_timed_reports(
+        &mut self,
+    ) -> io::Result<Vec<(std::time::Duration, Vec<PhysicalPointerEvent>)>> {
         let mut reports = Vec::new();
         let mut buffer = [0_u8; 24 * 64];
         let input_event_size = kernel_input_event_size();
-        loop {
+        for batch in 0..128 {
             let count = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count < 0 {
                 let error = io::Error::last_os_error();
@@ -1063,7 +1112,10 @@ impl EvdevTouchDevice {
                 return Err(error);
             }
             if count == 0 {
-                break;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "touch disconnected",
+                ));
             }
             if count as usize % input_event_size != 0 {
                 return Err(io::Error::new(
@@ -1071,13 +1123,16 @@ impl EvdevTouchDevice {
                     format!("evdev read was not aligned to {input_event_size}-byte input_event"),
                 ));
             }
+            if batch == 127 {
+                return Err(io::Error::other("touch drain budget exceeded"));
+            }
             for bytes in buffer[..count as usize].chunks_exact(input_event_size) {
                 let event = decode_kernel_input_event(bytes).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid kernel input_event")
                 })?;
                 let output = self.parser.push(event);
                 if !output.is_empty() {
-                    reports.push(output);
+                    reports.push((event_time(bytes), output));
                 }
             }
         }
@@ -1343,10 +1398,20 @@ impl EvdevPenDevice {
     }
 
     pub fn drain_reports(&mut self) -> io::Result<Vec<Vec<rm_display_protocol::PointerRecord>>> {
+        Ok(self
+            .drain_timed_reports()?
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect())
+    }
+
+    pub(crate) fn drain_timed_reports(
+        &mut self,
+    ) -> io::Result<Vec<(std::time::Duration, Vec<rm_display_protocol::PointerRecord>)>> {
         let mut reports = Vec::new();
         let mut buffer = [0_u8; 24 * 64];
         let size = kernel_input_event_size();
-        loop {
+        for batch in 0..128 {
             let count = unsafe { libc::read(self.fd, buffer.as_mut_ptr().cast(), buffer.len()) };
             if count < 0 {
                 let error = io::Error::last_os_error();
@@ -1370,6 +1435,9 @@ impl EvdevPenDevice {
                     "unaligned pen input_event",
                 ));
             }
+            if batch == 127 {
+                return Err(io::Error::other("pen drain budget exceeded"));
+            }
             for bytes in buffer[..count as usize].chunks_exact(size) {
                 let event = decode_kernel_input_event(bytes).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid pen input_event")
@@ -1377,7 +1445,7 @@ impl EvdevPenDevice {
                 if event.event_type == EV_SYN && event.code == SYN_DROPPED {
                     let cancelled = self.cancel();
                     if !cancelled.is_empty() {
-                        reports.push(cancelled);
+                        reports.push((event_time(bytes), cancelled));
                     }
                     self.dropped = true;
                     continue;
@@ -1448,7 +1516,7 @@ impl EvdevPenDevice {
                     (EV_SYN, SYN_REPORT) if self.dirty => {
                         let report = self.report();
                         if !report.is_empty() {
-                            reports.push(report);
+                            reports.push((event_time(bytes), report));
                         }
                     }
                     _ => {}

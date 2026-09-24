@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod evdev;
+#[cfg(target_os = "linux")]
+pub mod input_capture;
 mod local_menu;
 #[cfg(any(
     test,

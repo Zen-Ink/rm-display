@@ -369,7 +369,7 @@ impl ReceiverServer {
             secured
                 .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(10)))?;
-            return drive_connection(
+            let result = drive_connection(
                 &mut secured,
                 self.config.clone(),
                 self.panel.as_mut(),
@@ -377,16 +377,21 @@ impl ReceiverServer {
                 #[cfg(target_os = "linux")]
                 |stream| (stream.get_ref().as_raw_fd(), stream.ssl().pending() > 0),
                 #[cfg(target_os = "linux")]
-                self.input.as_mut(),
+                &mut self.input,
                 #[cfg(target_os = "linux")]
                 &mut self.pen,
                 #[cfg(target_os = "linux")]
                 self.power_key.as_ref(),
             );
+            #[cfg(target_os = "linux")]
+            if self.input.is_none() {
+                self.config.input_device = None;
+            }
+            return result;
         }
         let mut plain = stream;
         plain.set_read_timeout(Some(Duration::from_millis(10)))?;
-        drive_connection(
+        let result = drive_connection(
             &mut plain,
             self.config.clone(),
             self.panel.as_mut(),
@@ -394,12 +399,17 @@ impl ReceiverServer {
             #[cfg(target_os = "linux")]
             |stream| (stream.as_raw_fd(), false),
             #[cfg(target_os = "linux")]
-            self.input.as_mut(),
+            &mut self.input,
             #[cfg(target_os = "linux")]
             &mut self.pen,
             #[cfg(target_os = "linux")]
             self.power_key.as_ref(),
-        )
+        );
+        #[cfg(target_os = "linux")]
+        if self.input.is_none() {
+            self.config.input_device = None;
+        }
+        result
     }
 }
 
@@ -510,51 +520,82 @@ fn drive_connection<T: Read + Write>(
     panel: &mut dyn PanelBackend,
     fallback: Option<GraySurface>,
     #[cfg(target_os = "linux")] network_readiness: fn(&T) -> (std::os::fd::RawFd, bool),
-    #[cfg(target_os = "linux")] input_device: Option<&mut EvdevTouchDevice>,
+    #[cfg(target_os = "linux")] input_device: &mut Option<EvdevTouchDevice>,
     #[cfg(target_os = "linux")] pen: &mut Option<EvdevPenDevice>,
     #[cfg(target_os = "linux")] power_key: Option<&PowerKeyDevice>,
 ) -> Result<(), ServerError> {
-    let started = Instant::now();
-    let mut session = Session::new_with_fallback(config.clone(), panel, fallback);
     #[cfg(target_os = "linux")]
     {
-        // Discard queued events and the previous producer's contact on reconnect.
-        if let Some(device) = pen.as_mut() {
-            if let Err(error) = device.drain_reports() {
-                eprintln!("rm-display: pen input disabled: {error}");
-                *pen = None;
-            } else {
-                device.cancel();
-            }
+        let origin = crate::evdev::monotonic_now();
+        let started = Instant::now();
+        let capture = crate::input_capture::InputCapture::new()?;
+        let pen_available = pen.is_some();
+        // Scoped ownership ensures the reader is stopped and joined on every exit.
+        let (result, failed) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| capture.run(input_device.as_mut(), pen.as_mut(), origin));
+            let result = drive_connection_loop(
+                stream,
+                config,
+                panel,
+                fallback,
+                network_readiness,
+                &capture,
+                pen_available,
+                power_key,
+                started,
+                origin,
+            );
+            capture.stop();
+            reader.join().expect("evdev reader panicked");
+            (result, capture.failed())
+        });
+        if failed {
+            *input_device = None;
+            *pen = None;
         }
-        session.set_pen_available(pen.is_some());
+        result
     }
+    #[cfg(not(target_os = "linux"))]
+    drive_connection_loop(stream, config, panel, fallback, Instant::now())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_connection_loop<T: Read + Write>(
+    stream: &mut T,
+    config: ReceiverConfig,
+    panel: &mut dyn PanelBackend,
+    fallback: Option<GraySurface>,
+    #[cfg(target_os = "linux")] network_readiness: fn(&T) -> (std::os::fd::RawFd, bool),
+    #[cfg(target_os = "linux")] capture: &crate::input_capture::InputCapture,
+    #[cfg(target_os = "linux")] pen_available: bool,
+    #[cfg(target_os = "linux")] power_key: Option<&PowerKeyDevice>,
+    started: Instant,
+    #[cfg(target_os = "linux")] origin: Duration,
+) -> Result<(), ServerError> {
+    let mut session = Session::new_with_fallback(config.clone(), panel, fallback);
+    #[cfg(target_os = "linux")]
+    session.set_pen_available(pen_available);
     let mut codec = WireCodec::pre_handshake();
     let mut input = BytesMut::with_capacity(64 * 1024);
     let mut read_buffer = [0_u8; 64 * 1024];
-    #[cfg(target_os = "linux")]
-    let mut input_device = input_device;
 
     loop {
-        let now = started.elapsed();
+        let now = connection_elapsed(
+            &started,
+            #[cfg(target_os = "linux")]
+            origin,
+        );
         #[cfg(target_os = "linux")]
-        if let Some(device) = pen.as_mut() {
-            match device.drain_reports() {
-                Ok(reports) => write_envelopes(stream, &codec, session.pen_reports(reports, now)?)?,
-                Err(error) => {
-                    let cancelled = device.cancel();
-                    eprintln!("rm-display: pen input disabled: {error}");
-                    *pen = None;
-                    let envelopes = session.pen_reports(vec![cancelled], now)?;
-                    session.set_pen_available(false);
-                    write_envelopes(stream, &codec, envelopes)?;
+        for report in capture.drain() {
+            use crate::input_capture::Report;
+            let envelopes = match report.report {
+                Report::Touch(records) => session.input_reports(vec![records], report.time)?,
+                Report::Pen(records) => session.pen_reports(vec![records], report.time)?,
+                Report::Fault(message) => {
+                    eprintln!("rm-display: input capture disabled: {message}");
+                    session.input_capture_failed(report.time)?
                 }
-            }
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(device) = input_device.as_deref_mut() {
-            let reports = device.drain_reports()?;
-            let envelopes = session.input_reports(reports, now)?;
+            };
             write_envelopes(stream, &codec, envelopes)?;
         }
         // Process queued pen DOWN before presenting a newer pending base.
@@ -576,9 +617,21 @@ fn drive_connection<T: Read + Write>(
             };
         }
 
-        while let Some(envelope) = codec.decode(&mut input)? {
+        let mut decoded = 0;
+        for _ in 0..8 {
+            let Some(envelope) = codec.decode(&mut input)? else {
+                break;
+            };
+            decoded += 1;
             let related = envelope.message_id;
-            match session.handle_deferred(envelope, started.elapsed()) {
+            match session.handle_deferred(
+                envelope,
+                connection_elapsed(
+                    &started,
+                    #[cfg(target_os = "linux")]
+                    origin,
+                ),
+            ) {
                 Ok(responses) => write_envelopes(stream, &codec, responses)?,
                 Err(error) => {
                     let response = session.protocol_error(&error, related);
@@ -599,8 +652,19 @@ fn drive_connection<T: Read + Write>(
                 };
             }
         }
-        write_envelopes(stream, &codec, session.poll(started.elapsed())?)?;
+        write_envelopes(
+            stream,
+            &codec,
+            session.poll(connection_elapsed(
+                &started,
+                #[cfg(target_os = "linux")]
+                origin,
+            ))?,
+        )?;
 
+        if decoded == 8 {
+            continue;
+        }
         #[cfg(target_os = "linux")]
         {
             let (network_fd, buffered) = network_readiness(stream);
@@ -611,8 +675,7 @@ fn drive_connection<T: Read + Write>(
                     revents: 0,
                 }];
                 for fd in [
-                    pen.as_ref().map(EvdevPenDevice::event_fd),
-                    input_device.as_ref().map(|d| d.event_fd()),
+                    Some(capture.event_fd()),
                     power_key.map(PowerKeyDevice::event_fd),
                 ]
                 .into_iter()
@@ -653,6 +716,16 @@ fn drive_connection<T: Read + Write>(
             Err(error) => return Err(ServerError::Io(error)),
         }
     }
+}
+
+fn connection_elapsed(started: &Instant, #[cfg(target_os = "linux")] origin: Duration) -> Duration {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = started;
+        crate::evdev::monotonic_now().saturating_sub(origin)
+    }
+    #[cfg(not(target_os = "linux"))]
+    started.elapsed()
 }
 
 fn write_envelopes<T, I>(stream: &mut T, codec: &WireCodec, envelopes: I) -> Result<(), ServerError>
