@@ -42,8 +42,11 @@ rasterizes into a separate plane, then updates dirty bounds through reusable
 pixel buffers. Pen presentation uses the receiver's LATEST text policy; the
 receiver still owns cleanup and native waveform selection. Pen width is
 currently 5 physical pixels and eraser diameter 25. Pressure is forwarded but
-does not currently change local pen width. Menu interactions suppress pen
-forwarding; changing surfaces discards local ink.
+does not currently change local pen width. Menu entry sends CANCEL for previously forwarded touch contacts and the last
+pen contact/proximity, then clears the current ink segment. Menu interactions
+suppress pen forwarding. After menu exit, stale MOVE/UP is suppressed until a
+fresh DOWN; hover remains observable. Physical touch releases consumed by the
+menu still update gesture state. Changing surfaces discards local ink.
 
 Pointer coordinates are physical panel pixels in unsigned 16.16. Pressure is
 0..65535, tilt is -90..90 degrees (0 when absent). Flags bit 0 denotes eraser;

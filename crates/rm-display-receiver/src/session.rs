@@ -41,6 +41,8 @@ struct ActiveSurface {
     local_ink: bool,
     ink_frozen: bool,
     pen_point: Option<(u32, u32)>,
+    last_pen: Option<PointerRecord>,
+    pen_needs_down: bool,
     core: DisplayCore,
 }
 
@@ -166,6 +168,33 @@ impl<'a> Session<'a> {
             };
             if !surface.pen_enabled || self.local_menu.is_visible() {
                 surface.pen_point = None;
+                surface.pen_needs_down = true;
+                continue;
+            }
+            let records: Vec<_> = records
+                .into_iter()
+                .filter(|record| {
+                    let phase =
+                        PointerPhase::try_from(record.phase).unwrap_or(PointerPhase::Cancel);
+                    if surface.pen_needs_down
+                        && matches!(phase, PointerPhase::Move | PointerPhase::Up)
+                    {
+                        return false;
+                    }
+                    match phase {
+                        PointerPhase::Down => surface.pen_needs_down = false,
+                        PointerPhase::Up | PointerPhase::Cancel => surface.pen_needs_down = true,
+                        _ => {}
+                    }
+                    surface.last_pen = if phase == PointerPhase::Cancel {
+                        None
+                    } else {
+                        Some(record.clone())
+                    };
+                    true
+                })
+                .collect();
+            if records.is_empty() {
                 continue;
             }
             let mut terminals = Vec::new();
@@ -476,6 +505,8 @@ impl<'a> Session<'a> {
         let mut envelopes = Vec::new();
         for report in reports.into_iter().filter(|report| !report.is_empty()) {
             if self.local_menu.is_visible() {
+                // Keep physical releases current while menu consumes the contacts.
+                self.touch_gesture.process(report.clone(), false, false);
                 let geometry = self
                     .surface
                     .as_ref()
@@ -490,6 +521,7 @@ impl<'a> Session<'a> {
                 });
                 if let Some(action) = action {
                     envelopes.extend(self.handle_local_menu_action(action, monotonic)?);
+                    self.touch_gesture.surface_transition();
                 }
                 continue;
             }
@@ -527,9 +559,28 @@ impl<'a> Session<'a> {
         if self.surface.is_none() && self.fallback.is_none() {
             return Ok(Vec::new());
         }
-        self.touch_gesture.surface_transition();
+        let touch_cancelled = self.touch_gesture.surface_transition();
+        let mut responses = Vec::new();
+        if let Some(surface) = self.surface.as_mut() {
+            surface.pen_point = None;
+            surface.pen_needs_down = true;
+            let ids = (surface.surface_id, surface.generation);
+            let pen = surface.last_pen.take().map(|mut record| {
+                record.phase = PointerPhase::Cancel as i32;
+                record.buttons = 0;
+                record.pressure = 0;
+                record
+            });
+            if !touch_cancelled.is_empty() {
+                responses.push(self.pointer_batch(ids.0, ids.1, touch_cancelled, now));
+            }
+            if let Some(pen) = pen {
+                responses.extend(self.pen_reports(vec![vec![pen]], now)?);
+            }
+        }
         self.local_menu.toggle();
-        self.render_local_menu(now)
+        responses.extend(self.render_local_menu(now)?);
+        Ok(responses)
     }
 
     fn handle_local_menu_action(
@@ -883,6 +934,8 @@ impl<'a> Session<'a> {
             local_ink: false,
             ink_frozen: false,
             pen_point: None,
+            last_pen: None,
+            pen_needs_down: true,
             core,
         });
         let ready = SurfaceReady {

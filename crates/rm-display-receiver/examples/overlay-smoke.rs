@@ -65,7 +65,7 @@ fn main() -> Result<()> {
         name: "overlay smoke".into(),
         limits: ReceiverLimits::default(),
         refresh_policy: RefreshPolicyConfig::default(),
-        input_device: None,
+        input_device: Some("synthetic-touch".into()),
     };
     let mut panel = MockPanel::new(32, 32);
     {
@@ -94,8 +94,50 @@ fn main() -> Result<()> {
                     ..Default::default()
                 };
                 for response in
-                    session.pen_reports(vec![vec![pen]], now + Duration::from_secs(1))?
+                    session.pen_reports(vec![vec![pen.clone()]], now + Duration::from_secs(1))?
                 {
+                    send(&mut stream, &codec, response)?;
+                }
+                use rm_display_receiver::evdev::{
+                    PhysicalPointerEvent, PointerPhase as TouchPhase,
+                };
+                let touch = PhysicalPointerEvent {
+                    phase: TouchPhase::Down,
+                    contact_id: 8,
+                    x: 20,
+                    y: 20,
+                };
+                for response in session.input_reports(vec![vec![touch]], now)? {
+                    send(&mut stream, &codec, response)?;
+                }
+                for response in session.power_key_pressed(now)? {
+                    send(&mut stream, &codec, response)?;
+                }
+                // Physical releases consumed by the menu must not leave stale
+                // touch suppression or leak a pen continuation when it closes.
+                session.input_reports(
+                    vec![vec![PhysicalPointerEvent {
+                        phase: TouchPhase::Cancel,
+                        ..touch
+                    }]],
+                    now,
+                )?;
+                let mut stale = pen.clone();
+                stale.phase = PointerPhase::Move as i32;
+                if !session
+                    .pen_reports(vec![vec![stale.clone()]], now)?
+                    .is_empty()
+                {
+                    return Err("menu leaked pen input".into());
+                }
+                session.power_key_pressed(now)?;
+                if !session.pen_reports(vec![vec![stale]], now)?.is_empty() {
+                    return Err("menu close leaked stale pen MOVE".into());
+                }
+                for response in session.pen_reports(vec![vec![pen]], now)? {
+                    send(&mut stream, &codec, response)?;
+                }
+                for response in session.input_reports(vec![vec![touch]], now)? {
                     send(&mut stream, &codec, response)?;
                 }
             }
@@ -125,7 +167,7 @@ fn main() -> Result<()> {
     {
         return Err("clear did not restore the new base".into());
     }
-    println!("overlay/pen loopback: negotiated v2.3, patch, stale rejection, frozen snapshot, frame rejection, release/keyframe, independent clear OK ({} panel submissions)",panel.submissions().len());
+    println!("overlay/pen loopback: negotiated v2.3, patch, stale rejection, frozen snapshot, frame rejection, release/keyframe, independent clear, menu cancellation/restart OK ({} panel submissions)",panel.submissions().len());
     Ok(())
 }
 fn client(address: std::net::SocketAddr) -> Result<()> {
@@ -164,7 +206,7 @@ fn client(address: std::net::SocketAddr) -> Result<()> {
         Body::SurfaceOpen(SurfaceOpen {
             surface_id: 1,
             pixel_format: PixelFormat::Gray8 as i32,
-            input_capabilities: vec![InputCapability::Pen as i32],
+            input_capabilities: vec![InputCapability::Pen as i32, InputCapability::Touch as i32],
             ..Default::default()
         }),
     )?;
@@ -229,6 +271,18 @@ fn client(address: std::net::SocketAddr) -> Result<()> {
     if !matches!(pen.body,Some(Body::InputBatch(ref b)) if b.presented_frame_id==1 && b.ink_frozen && b.records[0].device==2)
     {
         return Err("pen snapshot binding failed".into());
+    }
+    for (device, phase) in [
+        (PointerDevice::Touch, PointerPhase::Down),
+        (PointerDevice::Touch, PointerPhase::Cancel),
+        (PointerDevice::Pen, PointerPhase::Cancel),
+        (PointerDevice::Pen, PointerPhase::Down),
+        (PointerDevice::Touch, PointerPhase::Down),
+    ] {
+        if !matches!(receive(&mut stream,&codec)?.body, Some(Body::InputBatch(ref batch)) if batch.records.len()==1 && batch.records[0].device==device as i32 && batch.records[0].phase==phase as i32)
+        {
+            return Err("menu pointer cancellation/restart failed".into());
+        }
     }
     if !matches!(exchange(&mut stream, &codec, &mut id, session, Body::Frame(frame(2,100)))?.body,Some(Body::FrameResult(ref r)) if r.reason==FrameResultReason::InkFrozen as i32)
     {

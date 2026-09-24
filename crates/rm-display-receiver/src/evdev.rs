@@ -274,11 +274,20 @@ impl FiveFingerCleanupGesture {
     /// Detach producer-visible contacts from an old surface without losing
     /// physical contact state. Any contact still down suppresses reports until
     /// all contacts are released, so MOVE/UP cannot leak into a new surface.
-    pub fn surface_transition(&mut self) {
-        self.forwarded.clear();
+    pub fn surface_transition(&mut self) -> Vec<PhysicalPointerEvent> {
+        let cancelled = std::mem::take(&mut self.forwarded)
+            .into_iter()
+            .map(|(contact_id, (x, y))| PhysicalPointerEvent {
+                phase: PointerPhase::Cancel,
+                contact_id,
+                x,
+                y,
+            })
+            .collect();
         if !self.active.is_empty() {
             self.suppress_until_clear = true;
         }
+        cancelled
     }
 
     pub fn process(
@@ -1712,7 +1721,11 @@ mod tests {
         let mut gesture = FiveFingerCleanupGesture::default();
         let first_four = (1..=4).map(|id| pointer(PointerPhase::Down, id)).collect();
         assert_eq!(gesture.process(first_four, true, true).forward.len(), 4);
-        gesture.surface_transition();
+        let cancelled = gesture.surface_transition();
+        assert_eq!(cancelled.len(), 4);
+        assert!(cancelled
+            .iter()
+            .all(|event| event.phase == PointerPhase::Cancel));
 
         assert_eq!(
             gesture.process(vec![pointer(PointerPhase::Move, 1)], true, true),
