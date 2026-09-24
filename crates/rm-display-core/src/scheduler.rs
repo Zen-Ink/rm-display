@@ -133,6 +133,7 @@ pub struct DisplayCore {
     fast_updates_since_settled: u32,
     partial_damage_pixels_since_cleanup: u64,
     last_partial_at: Option<Duration>,
+    last_idle_cleanup_failure: Option<Duration>,
 }
 
 impl DisplayCore {
@@ -188,6 +189,7 @@ impl DisplayCore {
             fast_updates_since_settled: 0,
             partial_damage_pixels_since_cleanup: 0,
             last_partial_at: None,
+            last_idle_cleanup_failure: None,
         })
     }
 
@@ -654,8 +656,25 @@ impl DisplayCore {
         now: Duration,
         panel: &mut dyn PanelBackend,
     ) -> Result<Vec<TerminalFrame>, CoreError> {
-        if self.pending.is_none() && self.adaptive_cleanup_due(now) {
-            return Ok(self.request_cleanup(now, panel)?.terminals);
+        self.tick_interactive(now, panel, true)
+    }
+
+    pub fn tick_interactive(
+        &mut self,
+        now: Duration,
+        panel: &mut dyn PanelBackend,
+        interaction_idle: bool,
+    ) -> Result<Vec<TerminalFrame>, CoreError> {
+        if interaction_idle
+            && self.pending.is_none()
+            && self.adaptive_cleanup_due(now)
+            && self
+                .last_idle_cleanup_failure
+                .is_none_or(|last| now.saturating_sub(last) >= Duration::from_secs(5))
+        {
+            let report = self.request_cleanup(now, panel)?;
+            self.last_idle_cleanup_failure = report.backend_failed.then_some(now);
+            return Ok(report.terminals);
         }
         self.tick_inner(now, panel, false)
     }
@@ -1418,7 +1437,11 @@ mod tests {
             core.tick(last_partial + idle - Duration::from_millis(1), &mut panel)
                 .unwrap();
             assert_eq!(panel.submissions().len(), screen_equivalents as usize);
-            core.tick(last_partial + idle, &mut panel).unwrap();
+            core.tick_interactive(last_partial + idle, &mut panel, false)
+                .unwrap();
+            assert_eq!(panel.submissions().len(), screen_equivalents as usize);
+            core.tick_interactive(last_partial + idle, &mut panel, true)
+                .unwrap();
             assert_eq!(panel.submissions().len(), screen_equivalents as usize + 1);
             assert!(panel.submissions().last().unwrap().refresh.complete_refresh);
             assert_eq!(core.partial_damage_pixels_since_cleanup, 0);

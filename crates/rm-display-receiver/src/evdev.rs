@@ -271,6 +271,10 @@ pub struct FiveFingerCleanupGesture {
 }
 
 impl FiveFingerCleanupGesture {
+    pub fn has_active_contacts(&self) -> bool {
+        !self.active.is_empty()
+    }
+
     /// Detach producer-visible contacts from an old surface without losing
     /// physical contact state. Any contact still down suppresses reports until
     /// all contacts are released, so MOVE/UP cannot leak into a new surface.

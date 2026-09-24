@@ -79,6 +79,8 @@ pub struct Session<'a> {
     cleanup_pending_without_surface: bool,
     refresh_debt_without_surface: RefreshDebt,
     touch_gesture: FiveFingerCleanupGesture,
+    last_interaction: Duration,
+    physical_pen_in_proximity: bool,
     local_menu: LocalMenu,
     last_custom_profile: Option<RefreshPolicyConfig>,
     surface: Option<ActiveSurface>,
@@ -128,6 +130,8 @@ impl<'a> Session<'a> {
             cleanup_pending_without_surface: false,
             refresh_debt_without_surface: RefreshDebt::default(),
             touch_gesture: FiveFingerCleanupGesture::default(),
+            last_interaction: Duration::ZERO,
+            physical_pen_in_proximity: false,
             local_menu: LocalMenu::default(),
             last_custom_profile: None,
             surface: None,
@@ -138,6 +142,7 @@ impl<'a> Session<'a> {
     pub fn set_pen_available(&mut self, available: bool) {
         self.pen_available = available;
         if !available {
+            self.physical_pen_in_proximity = false;
             if let Some(surface) = self.surface.as_mut() {
                 surface.pen_enabled = false;
                 surface.pen_point = None;
@@ -161,8 +166,23 @@ impl<'a> Session<'a> {
         reports: Vec<Vec<PointerRecord>>,
         now: Duration,
     ) -> Result<Vec<Envelope>, SessionError> {
+        self.pen_reports_inner(reports, now, true)
+    }
+
+    fn pen_reports_inner(
+        &mut self,
+        reports: Vec<Vec<PointerRecord>>,
+        now: Duration,
+        physical: bool,
+    ) -> Result<Vec<Envelope>, SessionError> {
         let mut responses = Vec::new();
         for records in reports {
+            if physical && !records.is_empty() {
+                self.last_interaction = now;
+                for record in &records {
+                    self.physical_pen_in_proximity = record.phase != PointerPhase::Cancel as i32;
+                }
+            }
             let Some(surface) = self.surface.as_mut() else {
                 continue;
             };
@@ -464,14 +484,14 @@ impl<'a> Session<'a> {
     }
 
     pub fn poll(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {
+        let interaction_idle = !self.physical_pen_in_proximity
+            && !self.touch_gesture.has_active_contacts()
+            && now.saturating_sub(self.last_interaction) >= Duration::from_secs(5);
         let terminals = match self.surface.as_mut() {
             Some(surface) => {
-                // A frozen annotation has no pending webpage work. Keep idle
-                // webpage cleanup from inserting quality flashes under the nib.
-                if surface.local_ink && surface.ink_frozen && surface.last_pen.is_some() {
-                    return Ok(Vec::new());
-                }
-                let terminals = surface.core.tick(now, self.panel)?;
+                let terminals = surface
+                    .core
+                    .tick_interactive(now, self.panel, interaction_idle)?;
                 self.cleanup_pending_without_surface = surface.core.cleanup_pending();
                 self.refresh_debt_without_surface = surface.core.refresh_debt();
                 terminals
@@ -509,6 +529,7 @@ impl<'a> Session<'a> {
         });
         let mut envelopes = Vec::new();
         for report in reports.into_iter().filter(|report| !report.is_empty()) {
+            self.last_interaction = monotonic;
             if self.local_menu.is_visible() {
                 // Keep physical releases current while menu consumes the contacts.
                 self.touch_gesture.process(report.clone(), false, false);
@@ -561,6 +582,7 @@ impl<'a> Session<'a> {
     }
 
     pub fn power_key_pressed(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {
+        self.last_interaction = now;
         if self.surface.is_none() && self.fallback.is_none() {
             return Ok(Vec::new());
         }
@@ -580,7 +602,7 @@ impl<'a> Session<'a> {
                 responses.push(self.pointer_batch(ids.0, ids.1, touch_cancelled, now));
             }
             if let Some(pen) = pen {
-                responses.extend(self.pen_reports(vec![vec![pen]], now)?);
+                responses.extend(self.pen_reports_inner(vec![vec![pen]], now, false)?);
             }
         }
         self.local_menu.toggle();

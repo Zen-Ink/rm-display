@@ -42,8 +42,10 @@ rasterizes into a separate plane, then updates dirty bounds through reusable
 pixel buffers. Pen presentation uses an independent partial Fastest waveform
 (RM2 native mode 0), bypassing webpage FPS and quality policy. Its exact dirty
 rectangle is not expanded to webpage damage tiles. Generic idle cleanup is
-paused while the frozen page's pen remains in proximity. Explicit receiver
-cleanup/menu actions remain available. `RM_DISPLAY_INK_WAVEFORM=fastest|fast|quality`
+paused while a physical touch remains down, the pen remains in proximity, or
+for five seconds after physical input. Each refresh profile keeps its existing
+damage and panel-idle thresholds; explicit receiver cleanup/menu actions remain
+available. `RM_DISPLAY_INK_WAVEFORM=fastest|fast|quality`
 selects a hardware calibration override (default `fastest`). Connected input
 polls evdev and the socket together, drains pen before touch/network processing,
 and handles buffered TLS data without waiting for another socket wakeup.
