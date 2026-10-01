@@ -66,6 +66,12 @@ fn hello() -> ClientHello {
     }
 }
 
+fn hello_with_pointer() -> ClientHello {
+    let mut hello = hello();
+    hello.features.push(ProtocolFeature::PointerInput as i32);
+    hello
+}
+
 fn hello_v21_color() -> ClientHello {
     let mut hello = hello();
     hello.max_minor = 1;
@@ -92,6 +98,7 @@ fn hello_v23_overlay() -> ClientHello {
     let mut hello = hello_v22_custom_profile();
     hello.max_minor = 3;
     hello.features.extend([
+        ProtocolFeature::PointerInput as i32,
         ProtocolFeature::RemoteOverlay as i32,
         ProtocolFeature::LocalInk as i32,
     ]);
@@ -577,7 +584,10 @@ fn physical_report_uses_surface_generation_sequence_and_fixed_point() {
     let mut panel = MockPanel::new(4, 3);
     let mut session = Session::new(config, &mut panel);
     session
-        .handle(envelope(0, 1, Body::ClientHello(hello())), Duration::ZERO)
+        .handle(
+            envelope(0, 1, Body::ClientHello(hello_with_pointer())),
+            Duration::ZERO,
+        )
         .unwrap();
     let session_id = session.session_id();
     let ready = session
@@ -1203,7 +1213,10 @@ fn five_finger_cleanup_is_local_and_cancels_forwarded_contacts() {
     let mut panel = MockPanel::new(4, 3);
     let mut session = Session::new(receiver_config, &mut panel);
     session
-        .handle(envelope(0, 1, Body::ClientHello(hello())), Duration::ZERO)
+        .handle(
+            envelope(0, 1, Body::ClientHello(hello_with_pointer())),
+            Duration::ZERO,
+        )
         .unwrap();
     let session_id = session.session_id();
     let ready = session
@@ -1505,7 +1518,10 @@ fn surface_close_open_suppresses_old_contacts_until_release() {
     let mut panel = MockPanel::new(4, 3);
     let mut session = Session::new(receiver_config, &mut panel);
     session
-        .handle(envelope(0, 1, Body::ClientHello(hello())), Duration::ZERO)
+        .handle(
+            envelope(0, 1, Body::ClientHello(hello_with_pointer())),
+            Duration::ZERO,
+        )
         .unwrap();
     let session_id = session.session_id();
     let open = |surface_id| SurfaceOpen {

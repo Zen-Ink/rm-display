@@ -2,9 +2,12 @@
 
 Negotiation adds `REMOTE_OVERLAY` (14) and `LOCAL_INK` (15). v2.3 also retains
 v2.1 byte credits and v2.2 custom profile support. Older peers negotiate their
-previous minor version. Pen uses the existing `POINTER_INPUT` feature and
-`InputCapability::Pen`; only a successfully opened digitizer is advertised.
-`LOCAL_INK` additionally requires `REMOTE_OVERLAY` and a working digitizer.
+previous minor version. Remote pen forwarding requires the negotiated
+`POINTER_INPUT` feature and a per-surface `InputCapability::Pen` subscription;
+only a successfully opened digitizer is advertised. Host control of `LOCAL_INK`
+requires `REMOTE_OVERLAY` and a working digitizer, but does not require PEN
+forwarding. Receiver-local `Session::set_local_ink` needs only an active surface
+and working digitizer, independently of the host's negotiated features.
 
 `Envelope.overlay_update` (100) / `overlay_result` (101) never reuse reserved
 field numbers. The update addresses a surface and generation, and carries a
@@ -24,8 +27,11 @@ menu. Peer updates never replace the remote frame delta base or receiver menu.
 `local_ink=true` arms local ink. First pen DOWN after an actually presented
 frame freezes that exact underlying base and cancels pending newer work.
 `InputBatch.presented_frame_id` (32) identifies that base;
-`InputBatch.ink_frozen` (33) tells the producer to stop sending frames. The pen
-batch precedes any cancelled-frame result. While frozen, frames receive
+`InputBatch.ink_frozen` (33) tells the producer to stop sending frames when
+input forwarding is enabled. Pen records are sent only to PEN subscribers;
+local-only ink sends no pen batch or empty freeze notification. Observe its
+state through the local API/hook. Subscribed touch batches can still carry the
+same frame/freeze metadata. When sent, the pen batch precedes any cancelled-frame result. While frozen, frames receive
 `REJECTED / INK_FROZEN` (reason 10); this is recoverable, the connection stays
 open. The sender client returns this as a frame report rather than an error.
 The producer must retain snapshots by frame ID and must not advance its own
@@ -88,6 +94,10 @@ The embedding application owns snapshot delivery, file saving, submission UI,
 and the choice of when to freeze, pause, clear, or clean the panel. These Rust
 APIs do not add wire messages or a deferred stroke-history buffer.
 
+- `set_local_ink(enabled, now)` controls local drawing without subscribing the
+  producer to PEN or requiring host `LOCAL_INK` negotiation. Disabling preserves
+  the mask, pause and freeze state. This differs from the wire command
+  `OverlayUpdate.local_ink=false`, which retains its clear-and-release semantics.
 - `ink_snapshot()` copies only the local black ink plane, excluding the remote
   background, producer overlay and receiver menu. It returns surface ID,
   generation, presented frame ID, dimensions, frozen state and a packed mask.
@@ -96,7 +106,8 @@ APIs do not add wire messages or a deferred stroke-history buffer.
   a snapshot does not freeze, pause, clear, or redraw anything.
 - `set_ink_paused(paused, now)` controls local raster mutation. Physical input
   and producer input delivery continue. Resuming requires a fresh DOWN and
-  rejects input captured before the change. Pause and snapshot on the same
+  rejects local drawing from input captured before the change. These drawing
+  boundaries do not suppress subscribed remote MOVE/UP records. Pause and snapshot on the same
   display thread when retries must retain an unchanged mask.
 - `clear_ink(now)` clears only local ink, preserving peer overlays, the frozen
   background and pause state. Save successfully before calling it when the
@@ -104,7 +115,8 @@ APIs do not add wire messages or a deferred stroke-history buffer.
 - `set_frame_frozen(frozen, now)` explicitly freezes the presented background
   or releases it without clearing ink. Freezing before the first presentation
   is rejected. Pending frames are cancelled with terminal responses; resume
-  requires a fresh keyframe. Returned input metadata reports the new state.
+  requires a fresh keyframe. Empty input metadata reports the new state only
+  for a producer subscribed to PEN; local applications use the snapshot/hook.
 - `set_freeze_on_pen_down(false)` permits local ink over a live background.
   The default remains first-DOWN freeze for existing v2.3 clients. Applications
   wanting that exact boundary should use the receiver-side first-DOWN policy,

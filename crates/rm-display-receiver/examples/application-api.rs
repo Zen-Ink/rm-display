@@ -77,7 +77,157 @@ fn send(session: &mut Session<'_>, id: &mut u32, body: Body, second: u64) -> Res
         Duration::from_secs(second),
     )?)
 }
+fn input_negotiation() -> Result<()> {
+    use rm_display_receiver::evdev::{PhysicalPointerEvent, PointerPhase as TouchPhase};
+    // Missing connection capability, display-only, touch-only, and pen forwarding.
+    for (pointer, requested) in [
+        (false, vec![InputCapability::Touch, InputCapability::Pen]),
+        (true, vec![]),
+        (
+            true,
+            vec![
+                InputCapability::Touch,
+                InputCapability::Key,
+                InputCapability::Text,
+            ],
+        ),
+        (true, vec![InputCapability::Pen]),
+    ] {
+        let mut receiver_config = config();
+        receiver_config.input_device = Some("synthetic-touch".into());
+        let mut panel = MockPanel::new(33, 33);
+        let mut session = Session::new(receiver_config, &mut panel);
+        session.set_pen_available(true);
+        let mut id = 0;
+        let Body::ClientHello(mut client) = hello() else {
+            unreachable!()
+        };
+        // Touch-only also exercises negotiated wire activation without PEN.
+        let remote_local_control = pointer && requested.contains(&InputCapability::Touch);
+        client.features.retain(|f| {
+            (remote_local_control || *f != ProtocolFeature::LocalInk as i32)
+                && (pointer || *f != ProtocolFeature::PointerInput as i32)
+        });
+        client.features.extend([
+            ProtocolFeature::KeyInput as i32,
+            ProtocolFeature::TextInput as i32,
+        ]);
+        let response = send(&mut session, &mut id, Body::ClientHello(client), 0)?;
+        let Some(Body::ServerHello(server)) = &response[0].body else {
+            unreachable!()
+        };
+        assert_eq!(
+            server
+                .features
+                .contains(&(ProtocolFeature::PointerInput as i32)),
+            pointer
+        );
+        assert!(!server
+            .features
+            .contains(&(ProtocolFeature::KeyInput as i32)));
+        assert!(!server
+            .features
+            .contains(&(ProtocolFeature::TextInput as i32)));
+        let Body::SurfaceOpen(mut surface) = open() else {
+            unreachable!()
+        };
+        surface.input_capabilities = requested.iter().map(|c| *c as i32).collect();
+        let response = send(&mut session, &mut id, Body::SurfaceOpen(surface), 0)?;
+        let Some(Body::SurfaceReady(ready)) = &response[0].body else {
+            unreachable!()
+        };
+        let forward_pen = pointer && requested.contains(&InputCapability::Pen);
+        let forward_touch = pointer && requested.contains(&InputCapability::Touch);
+        assert_eq!(
+            ready.input_capabilities,
+            [InputCapability::Touch, InputCapability::Pen]
+                .into_iter()
+                .filter(|c| pointer && requested.contains(c))
+                .map(|c| c as i32)
+                .collect::<Vec<_>>()
+        );
+        send(&mut session, &mut id, frame(1, 0), 1)?;
+        if remote_local_control {
+            let response = send(
+                &mut session,
+                &mut id,
+                Body::OverlayUpdate(OverlayUpdate {
+                    surface_id: 1,
+                    generation: 1,
+                    sequence: 1,
+                    local_ink: Some(true),
+                    ..Default::default()
+                }),
+                2,
+            )?;
+            assert!(response
+                .iter()
+                .any(|e| matches!(&e.body, Some(Body::OverlayResult(r)) if r.applied)));
+        } else {
+            session.set_local_ink(true, Duration::from_secs(2))?;
+        }
+        let pen = PointerRecord {
+            device: PointerDevice::Pen as i32,
+            phase: PointerPhase::Down as i32,
+            x_16_16: 16 << 16,
+            y_16_16: 16 << 16,
+            buttons: 1,
+            ..Default::default()
+        };
+        let response = session.pen_reports(vec![vec![pen]], Duration::from_secs(3))?;
+        assert_eq!(
+            response
+                .iter()
+                .any(|e| matches!(&e.body, Some(Body::InputBatch(_)))),
+            forward_pen
+        );
+        let ink = session.ink_snapshot()?;
+        assert!(ink.frozen && ink.bitmap.iter().any(|b| *b != 0));
+        assert!(session.interaction_state().pen_in_proximity);
+        let response = session.input_reports(
+            vec![vec![PhysicalPointerEvent {
+                phase: TouchPhase::Down,
+                contact_id: 1,
+                x: 16,
+                y: 16,
+            }]],
+            Duration::from_secs(4),
+        )?;
+        assert_eq!(
+            response
+                .iter()
+                .any(|e| matches!(&e.body, Some(Body::InputBatch(_)))),
+            forward_touch
+        );
+        // Menu cancellation must not leak unsubscribed pen records.
+        for e in session.power_key_pressed(Duration::from_secs(5))? {
+            if let Some(Body::InputBatch(batch)) = e.body {
+                assert!(!batch.records.is_empty());
+                assert!(batch.records.iter().all(|r| {
+                    match PointerDevice::try_from(r.device).unwrap() {
+                        PointerDevice::Pen => forward_pen,
+                        PointerDevice::Touch => forward_touch,
+                        _ => false,
+                    }
+                }));
+            }
+        }
+        session.power_key_pressed(Duration::from_secs(6))?;
+        let response = session.set_frame_frozen(false, Duration::from_secs(7))?;
+        assert_eq!(
+            response
+                .iter()
+                .any(|e| matches!(&e.body, Some(Body::InputBatch(_)))),
+            forward_pen
+        );
+        session.set_local_ink(false, Duration::from_secs(8))?;
+        assert_eq!(ink.bitmap, session.ink_snapshot()?.bitmap);
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
+    input_negotiation()?;
     // Coverage uses continuous rows, including non-byte-aligned row boundaries.
     let mut overlay = LocalOverlay::transparent(3, 3)?;
     overlay.patch(
@@ -151,6 +301,16 @@ fn main() -> Result<()> {
         Duration::from_secs(6),
     )?;
     assert_eq!(paused, session.ink_snapshot()?);
+    for phase in [PointerPhase::Move, PointerPhase::Up] {
+        let forwarded = session.pen_reports(
+            vec![vec![PointerRecord {
+                phase: phase as i32,
+                ..pen.clone()
+            }]],
+            Duration::from_secs(6),
+        )?;
+        assert!(forwarded.iter().any(|e| matches!(&e.body, Some(Body::InputBatch(batch)) if batch.records[0].phase == phase as i32)));
+    }
     session.set_frame_frozen(true, Duration::from_secs(7))?;
     let frozen = session.ink_snapshot()?;
     assert!(frozen.frozen);
@@ -285,6 +445,6 @@ fn main() -> Result<()> {
     });
     server.run_one()?;
     client.join().unwrap();
-    println!("application API: live ink, pure snapshot, pause, freeze/resume, keyframe, explicit cleanup, stale input, server hook OK");
+    println!("application API: input negotiation, local-only ink, no pen leakage, live ink, snapshot, pause, freeze/resume, cleanup, server hook OK");
     Ok(())
 }

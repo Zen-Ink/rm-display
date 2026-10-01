@@ -196,7 +196,14 @@ the new inverse mapping; queued MOVE/UP records without a new DOWN are then
 dropped. Every frame and input message carries the surface generation; stale
 generations are rejected.
 
-Input and action capabilities are producer-declared per surface:
+Input and action capabilities are producer-declared per surface.
+`ServerHello.display.input_capabilities` lists available device input types;
+`SurfaceReady.input_capabilities` lists the types actually enabled for remote
+forwarding. TOUCH/PEN/MOUSE require negotiated `POINTER_INPUT`, KEY requires
+`KEY_INPUT`, and TEXT requires `TEXT_INPUT`, in addition to the matching
+`SurfaceOpen` subscription and a supported receiver backend. Unsupported types
+are omitted from `SurfaceReady`; requesting them does not enable a backend or
+introduce a new rejection. Examples:
 
 - browser producer: pointer, text, keys, and navigation actions;
 - screen mirror: display-only unless Android Accessibility permission is
@@ -291,9 +298,18 @@ usage page/usage, not Linux or Android private keycodes.
 `INPUT_CAPABILITY_TEXT` means Unicode IME operations; `TextInput` distinguishes
 commit, composition, and cancel. They are separate because a key does not imply
 text and IME text often has no corresponding physical key. The current Quill
-receiver advertises and emits only `TOUCH`; Android and the CLI retain KEY/TEXT
-handlers for a future receiver keyboard or physical-key backend, so those two
-capabilities are not currently negotiated end to end.
+receiver implements `TOUCH` and `PEN` when the corresponding devices are
+available; it has no mouse, keyboard or IME backend. Android and the CLI retain
+KEY/TEXT handlers for a future receiver backend, so those two capabilities are
+not currently negotiated end to end.
+
+Local input consumption is separate from remote forwarding. Receiver menu,
+five-finger cleanup and local ink may consume physical input without the
+producer subscribing to it. `LOCAL_INK` negotiates host control of drawing,
+not a PEN subscription. Local-only pen drawing must not emit pen records or
+empty `InputBatch` state notifications. A TOUCH-only subscription may still
+receive touch records while pen drawing remains local. Receiver applications
+observe local pen proximity and frozen state through their local API/hook.
 
 `ActionInvoke` is receiver-to-producer and only uses actions declared in
 `SurfaceOpen`. Back, forward, reload, home, menu, previous-page, and next-page
