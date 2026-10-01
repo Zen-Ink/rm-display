@@ -80,3 +80,73 @@ TCP loopback replay covering negotiation, patch/clear, stale sequence rejection,
 synthetic pen snapshot binding, frozen-frame rejection and release/keyframe.
 This is an operational example, not a unit-test suite. Real input timing,
 physical placement and e-paper quality still require device acceptance.
+
+## Embedded application APIs
+
+`rm-display-receiver` exposes receiver-local capabilities through `Session`.
+The embedding application owns snapshot delivery, file saving, submission UI,
+and the choice of when to freeze, pause, clear, or clean the panel. These Rust
+APIs do not add wire messages or a deferred stroke-history buffer.
+
+- `ink_snapshot()` copies only the local black ink plane, excluding the remote
+  background, producer overlay and receiver menu. It returns surface ID,
+  generation, presented frame ID, dimensions, frozen state and a packed mask.
+  Bits are continuous row-major MSB-first, without row padding; unused tail
+  bits are zero. A fully erased plane returns a full-length zero mask. Reading
+  a snapshot does not freeze, pause, clear, or redraw anything.
+- `set_ink_paused(paused, now)` controls local raster mutation. Physical input
+  and producer input delivery continue. Resuming requires a fresh DOWN and
+  rejects input captured before the change. Pause and snapshot on the same
+  display thread when retries must retain an unchanged mask.
+- `clear_ink(now)` clears only local ink, preserving peer overlays, the frozen
+  background and pause state. Save successfully before calling it when the
+  application must retain unsaved work.
+- `set_frame_frozen(frozen, now)` explicitly freezes the presented background
+  or releases it without clearing ink. Freezing before the first presentation
+  is rejected. Pending frames are cancelled with terminal responses; resume
+  requires a fresh keyframe. Returned input metadata reports the new state.
+- `set_freeze_on_pen_down(false)` permits local ink over a live background.
+  The default remains first-DOWN freeze for existing v2.3 clients. Applications
+  wanting that exact boundary should use the receiver-side first-DOWN policy,
+  rather than waiting for a host round trip. Explicit freeze and pause are
+  independent, and a frozen background still allows drawing unless paused.
+- `set_automatic_idle_cleanup(false)` disables profile-based idle maintenance.
+  `interaction_state()`, `last_partial_at()` and `current_refresh_state()` let
+  the application choose its idle rule. `request_cleanup(now)` returns the
+  cleanup report plus producer responses. Explicit cleanup and configured
+  frame refresh thresholds still work; no fixed 30-update/5-second rule is
+  imposed by this API. Cleanup preserves the current composite and local ink.
+
+`ReceiverServer::set_session_hook` calls the embedding application's callback
+on the display thread at connection initialization and on each loop iteration,
+after physical input and before scheduled presentation. The server forwards
+all envelopes returned by the hook. A direct `Session` user must forward all
+returned envelopes itself, including cancelled-frame terminals. The hook
+persists across reconnects, while `now` is a monotonic duration relative to the
+new connection. Use `session_id()` to distinguish connections; surface IDs and
+generations belong to that session. The hook covers connected sessions, not
+pre-connection pairing/menu UI.
+
+For example, an application can take ownership of idle maintenance while
+using a channel in the callback to receive snapshot or cleanup requests:
+
+```rust,ignore
+server.set_session_hook(move |session, now| {
+    session.set_automatic_idle_cleanup(false);
+    // Drain application commands here without blocking. For a snapshot:
+    // session.set_ink_paused(true, now)?;
+    // snapshot_tx.send(session.ink_snapshot()?) ...
+    // For a cleanup request, return session.request_cleanup(now)?.1.
+    Ok(Vec::new())
+});
+```
+
+Keep the hook short: move file and network I/O to the application worker after
+copying a snapshot. Local ink, pause and freeze state are surface/session
+memory; snapshot ownership is transferred by copying, not device persistence.
+A host wanting bitmap delivery must arrange its own application transport.
+
+Run `cargo run -p rm-display-receiver --example application-api --offline` for
+live-background drawing, pure snapshot reads, non-byte-aligned masks, pause,
+freeze/resume, keyframe recovery, explicit cleanup, stale input suppression and
+an actual server hook/channel exchange without device hardware.

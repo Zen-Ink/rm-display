@@ -10,7 +10,7 @@ use rm_display_core::{
     FullRefreshReason, GraySurface, PanelBackend, PanelError, RefreshDecision, Waveform,
 };
 use rm_display_protocol::wire::{WireCodec, WireError};
-use rm_display_protocol::Rect;
+use rm_display_protocol::{Envelope, Rect};
 #[cfg(feature = "tls")]
 use rm_display_transport::{Psk, PskServerConfig};
 use thiserror::Error;
@@ -31,8 +31,11 @@ use crate::evdev::{EvdevPenDevice, EvdevTouchDevice};
 use crate::pairing::{pairing_uri, render_pairing_frame, PairingError};
 use crate::session::{Session, SessionError};
 
+type SessionHook = dyn FnMut(&mut Session<'_>, Duration) -> Result<Vec<Envelope>, SessionError>;
+
 pub struct ReceiverServer {
     config: ReceiverConfig,
+    session_hook: Option<Box<SessionHook>>,
     listener: TcpListener,
     #[cfg(feature = "tls")]
     psk: Option<PskServerConfig>,
@@ -184,6 +187,7 @@ impl ReceiverServer {
         };
         Ok(Self {
             config,
+            session_hook: None,
             listener,
             #[cfg(feature = "tls")]
             psk,
@@ -199,6 +203,18 @@ impl ReceiverServer {
             #[cfg(target_os = "linux")]
             power_key,
         })
+    }
+
+    /// Run application policy on the display thread, once when a session starts
+    /// and on each connection iteration after physical input, before frame polling.
+    /// The server sends returned envelopes in order. Keep the callback short;
+    /// use a channel for external requests and offload snapshot file/network I/O.
+    /// The callback persists across connections; `now` resets for each session.
+    pub fn set_session_hook<F>(&mut self, hook: F)
+    where
+        F: FnMut(&mut Session<'_>, Duration) -> Result<Vec<Envelope>, SessionError> + 'static,
+    {
+        self.session_hook = Some(Box::new(hook));
     }
 
     pub fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
@@ -374,6 +390,7 @@ impl ReceiverServer {
                 self.config.clone(),
                 self.panel.as_mut(),
                 Some(self.pairing_frame.clone()),
+                &mut self.session_hook,
                 #[cfg(target_os = "linux")]
                 |stream| (stream.get_ref().as_raw_fd(), stream.ssl().pending() > 0),
                 #[cfg(target_os = "linux")]
@@ -396,6 +413,7 @@ impl ReceiverServer {
             self.config.clone(),
             self.panel.as_mut(),
             Some(self.pairing_frame.clone()),
+            &mut self.session_hook,
             #[cfg(target_os = "linux")]
             |stream| (stream.as_raw_fd(), false),
             #[cfg(target_os = "linux")]
@@ -519,6 +537,7 @@ fn drive_connection<T: Read + Write>(
     config: ReceiverConfig,
     panel: &mut dyn PanelBackend,
     fallback: Option<GraySurface>,
+    hook: &mut Option<Box<SessionHook>>,
     #[cfg(target_os = "linux")] network_readiness: fn(&T) -> (std::os::fd::RawFd, bool),
     #[cfg(target_os = "linux")] input_device: &mut Option<EvdevTouchDevice>,
     #[cfg(target_os = "linux")] pen: &mut Option<EvdevPenDevice>,
@@ -538,6 +557,7 @@ fn drive_connection<T: Read + Write>(
                 config,
                 panel,
                 fallback,
+                hook,
                 network_readiness,
                 &capture,
                 pen_available,
@@ -556,7 +576,7 @@ fn drive_connection<T: Read + Write>(
         result
     }
     #[cfg(not(target_os = "linux"))]
-    drive_connection_loop(stream, config, panel, fallback, Instant::now())
+    drive_connection_loop(stream, config, panel, fallback, hook, Instant::now())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -565,6 +585,7 @@ fn drive_connection_loop<T: Read + Write>(
     config: ReceiverConfig,
     panel: &mut dyn PanelBackend,
     fallback: Option<GraySurface>,
+    hook: &mut Option<Box<SessionHook>>,
     #[cfg(target_os = "linux")] network_readiness: fn(&T) -> (std::os::fd::RawFd, bool),
     #[cfg(target_os = "linux")] capture: &crate::input_capture::InputCapture,
     #[cfg(target_os = "linux")] pen_available: bool,
@@ -578,6 +599,9 @@ fn drive_connection_loop<T: Read + Write>(
     let mut codec = WireCodec::pre_handshake();
     let mut input = BytesMut::with_capacity(64 * 1024);
     let mut read_buffer = [0_u8; 64 * 1024];
+    if let Some(hook) = hook.as_mut() {
+        write_envelopes(stream, &codec, hook(&mut session, Duration::ZERO)?)?;
+    }
 
     loop {
         let now = connection_elapsed(
@@ -598,8 +622,6 @@ fn drive_connection_loop<T: Read + Write>(
             };
             write_envelopes(stream, &codec, envelopes)?;
         }
-        // Process queued pen DOWN before presenting a newer pending base.
-        write_envelopes(stream, &codec, session.poll(now)?)?;
         #[cfg(target_os = "linux")]
         if let Some(device) = power_key {
             for _ in 0..device.drain_presses() {
@@ -607,6 +629,16 @@ fn drive_connection_loop<T: Read + Write>(
                 write_envelopes(stream, &codec, envelopes)?;
             }
         }
+        let now = connection_elapsed(
+            &started,
+            #[cfg(target_os = "linux")]
+            origin,
+        );
+        if let Some(hook) = hook.as_mut() {
+            write_envelopes(stream, &codec, hook(&mut session, now)?)?;
+        }
+        // Process queued pen DOWN before presenting a newer pending base.
+        write_envelopes(stream, &codec, session.poll(now)?)?;
         if session.is_closed() {
             return if session.pairing_reset_requested() {
                 Err(ServerError::NewPair)
@@ -731,7 +763,7 @@ fn connection_elapsed(started: &Instant, #[cfg(target_os = "linux")] origin: Dur
 fn write_envelopes<T, I>(stream: &mut T, codec: &WireCodec, envelopes: I) -> Result<(), ServerError>
 where
     T: Write,
-    I: IntoIterator<Item = rm_display_protocol::Envelope>,
+    I: IntoIterator<Item = Envelope>,
 {
     let mut output = BytesMut::new();
     for envelope in envelopes {

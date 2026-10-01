@@ -26,4 +26,4 @@ pub mod session;
 
 pub use config::{ReceiverConfig, ReceiverLimits, ReservedZeroToken, SecurityMode, TokenVerifier};
 pub use server::ReceiverServer;
-pub use session::{Session, SessionError};
+pub use session::{InkSnapshot, InteractionState, Session, SessionError};

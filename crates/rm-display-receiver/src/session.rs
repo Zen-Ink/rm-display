@@ -2,9 +2,9 @@ use std::time::{Duration, Instant};
 
 use rand::{rngs::OsRng, RngCore};
 use rm_display_core::{
-    CoreError, DisplayCore, GraySurface, LocalOverlay, PanelBackend, PresentationOutcome,
-    RefreshDebt, RefreshDecision, RefreshPolicyConfig, RefreshProfile as CoreRefreshProfile,
-    TerminalFrame, Waveform,
+    CleanupReport, CoreError, DisplayCore, GraySurface, LocalOverlay, PanelBackend,
+    PresentationOutcome, RefreshDebt, RefreshDecision, RefreshPolicyConfig,
+    RefreshProfile as CoreRefreshProfile, TerminalFrame, Waveform,
 };
 use rm_display_protocol::envelope::Body;
 use rm_display_protocol::semantic::{validate_and_decode_frame, SemanticError, SurfaceState};
@@ -43,12 +43,33 @@ struct ActiveSurface {
     pen_point: Option<(u32, u32)>,
     last_pen: Option<PointerRecord>,
     pen_needs_down: bool,
+    ink_paused: bool,
     core: DisplayCore,
 }
 
 struct LocalFallback {
     base: GraySurface,
     overlay: LocalOverlay,
+}
+
+/// Receiver-local snapshot. Export does not pause, freeze, clear, or redraw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InkSnapshot {
+    pub surface_id: u32,
+    pub generation: u32,
+    pub presented_frame_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub frozen: bool,
+    /// Continuous row-major MSB-first bits: one black, zero transparent.
+    pub bitmap: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InteractionState {
+    pub last_input_at: Duration,
+    pub touch_active: bool,
+    pub pen_in_proximity: bool,
 }
 
 pub struct Session<'a> {
@@ -82,6 +103,8 @@ pub struct Session<'a> {
     touch_gesture: FiveFingerCleanupGesture,
     last_interaction: Duration,
     physical_pen_in_proximity: bool,
+    freeze_on_pen_down: bool,
+    automatic_idle_cleanup: bool,
     local_menu: LocalMenu,
     last_custom_profile: Option<RefreshPolicyConfig>,
     surface: Option<ActiveSurface>,
@@ -134,11 +157,151 @@ impl<'a> Session<'a> {
             touch_gesture: FiveFingerCleanupGesture::default(),
             last_interaction: Duration::ZERO,
             physical_pen_in_proximity: false,
+            freeze_on_pen_down: true,
+            automatic_idle_cleanup: true,
             local_menu: LocalMenu::default(),
             last_custom_profile: None,
             surface: None,
             fallback,
         }
+    }
+
+    /// Retain v2.3 first-DOWN freezing by default; disable for live backgrounds
+    /// or use `set_frame_frozen` to choose an explicit application boundary.
+    pub fn set_freeze_on_pen_down(&mut self, enabled: bool) {
+        self.freeze_on_pen_down = enabled;
+    }
+
+    /// Disable profile-based idle cleanup when the application owns its timing.
+    /// Explicit cleanup and configured frame refresh policy remain active.
+    pub fn set_automatic_idle_cleanup(&mut self, enabled: bool) {
+        self.automatic_idle_cleanup = enabled;
+    }
+
+    pub fn interaction_state(&self) -> InteractionState {
+        InteractionState {
+            last_input_at: self.last_interaction,
+            touch_active: self.touch_gesture.has_active_contacts(),
+            pen_in_proximity: self.physical_pen_in_proximity,
+        }
+    }
+
+    pub fn last_partial_at(&self) -> Option<Duration> {
+        self.surface.as_ref().and_then(|s| s.core.last_partial_at())
+    }
+
+    pub fn ink_snapshot(&self) -> Result<InkSnapshot, SessionError> {
+        let surface = self
+            .surface
+            .as_ref()
+            .ok_or(SessionError::BadSurface("no active surface"))?;
+        Ok(InkSnapshot {
+            surface_id: surface.surface_id,
+            generation: surface.generation,
+            presented_frame_id: surface.core.presented_frame_id(),
+            width: surface.core.width(),
+            height: surface.core.height(),
+            frozen: surface.ink_frozen,
+            bitmap: surface.core.ink().coverage_bitmap(),
+        })
+    }
+
+    /// Stop local raster changes while still processing physical input. Resuming
+    /// requires a fresh DOWN; previously captured input cannot modify the draft.
+    pub fn set_ink_paused(&mut self, paused: bool, now: Duration) -> Result<(), SessionError> {
+        let surface = self
+            .surface
+            .as_mut()
+            .ok_or(SessionError::BadSurface("no active surface"))?;
+        if surface.ink_paused != paused {
+            surface.ink_paused = paused;
+            surface.pen_point = None;
+            surface.pen_needs_down = true;
+            self.input_not_before = self.input_not_before.max(now);
+        }
+        Ok(())
+    }
+
+    /// Clear only receiver-local ink; preserve the background, peer overlay,
+    /// freeze and pause state. Forward any resulting frame terminal responses.
+    pub fn clear_ink(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {
+        let surface = self
+            .surface
+            .as_mut()
+            .ok_or(SessionError::BadSurface("no active surface"))?;
+        surface.core.ink_mut().clear();
+        surface.pen_point = None;
+        surface.pen_needs_down = true;
+        self.input_not_before = self.input_not_before.max(now);
+        let terminals = surface.core.present_ink(now, self.panel)?;
+        Ok(terminals
+            .into_iter()
+            .map(|t| self.terminal_result(t))
+            .collect())
+    }
+
+    /// Freeze the currently presented background, cancelling pending frames.
+    /// Unfreeze preserves ink and requires a new keyframe. Return every response
+    /// to the producer, including cancelled-frame terminals and freeze metadata.
+    pub fn set_frame_frozen(
+        &mut self,
+        frozen: bool,
+        now: Duration,
+    ) -> Result<Vec<Envelope>, SessionError> {
+        let surface = self
+            .surface
+            .as_mut()
+            .ok_or(SessionError::BadSurface("no active surface"))?;
+        if surface.ink_frozen == frozen {
+            return Ok(Vec::new());
+        }
+        if frozen && surface.core.presented_frame_id() == 0 {
+            return Err(SessionError::BadSurface("no presented frame to freeze"));
+        }
+        surface.ink_frozen = frozen;
+        surface.pen_point = None;
+        surface.pen_needs_down = true;
+        self.input_not_before = self.input_not_before.max(now);
+        let terminal = if frozen {
+            surface.core.freeze_presented()
+        } else {
+            None
+        };
+        let (id, generation) = (surface.surface_id, surface.generation);
+        let mut responses = Vec::new();
+        if let Some(terminal) = terminal {
+            responses.push(self.terminal_result(terminal));
+        }
+        responses.push(self.pointer_batch(id, generation, Vec::new(), now));
+        Ok(responses)
+    }
+
+    /// Request maintenance on the owning display thread. With no surface the
+    /// request is armed for the next frame. Forward the returned envelopes.
+    pub fn request_cleanup(
+        &mut self,
+        now: Duration,
+    ) -> Result<(CleanupReport, Vec<Envelope>), SessionError> {
+        let report = if let Some(surface) = self.surface.as_mut() {
+            let report = surface.core.request_cleanup(now, self.panel)?;
+            self.refresh_debt_without_surface = surface.core.refresh_debt();
+            report
+        } else {
+            CleanupReport {
+                cleanup_performed: false,
+                cleanup_pending: true,
+                backend_failed: false,
+                terminals: Vec::new(),
+            }
+        };
+        self.cleanup_pending_without_surface = report.cleanup_pending;
+        let responses = report
+            .terminals
+            .iter()
+            .cloned()
+            .map(|t| self.terminal_result(t))
+            .collect();
+        Ok((report, responses))
     }
 
     pub fn set_pen_available(&mut self, available: bool) {
@@ -226,6 +389,8 @@ impl<'a> Session<'a> {
             for record in &records {
                 let phase = PointerPhase::try_from(record.phase).unwrap_or(PointerPhase::Cancel);
                 if surface.local_ink
+                    && !surface.ink_paused
+                    && self.freeze_on_pen_down
                     && phase == PointerPhase::Down
                     && !surface.ink_frozen
                     && surface.core.presented_frame_id() != 0
@@ -234,7 +399,8 @@ impl<'a> Session<'a> {
                     terminals.extend(surface.core.freeze_presented());
                 }
                 if surface.local_ink
-                    && surface.ink_frozen
+                    && !surface.ink_paused
+                    && surface.core.presented_frame_id() != 0
                     && matches!(phase, PointerPhase::Down | PointerPhase::Move)
                 {
                     let point = (
@@ -275,7 +441,7 @@ impl<'a> Session<'a> {
             );
         }
         if let Some(surface) = self.surface.as_mut() {
-            if surface.local_ink && surface.ink_frozen {
+            if surface.local_ink {
                 let terminals = surface.core.present_ink(now, self.panel)?;
                 responses.extend(
                     terminals
@@ -502,9 +668,13 @@ impl<'a> Session<'a> {
             && now.saturating_sub(self.last_interaction) >= Duration::from_secs(5);
         let terminals = match self.surface.as_mut() {
             Some(surface) => {
-                let terminals = surface
-                    .core
-                    .tick_interactive(now, self.panel, interaction_idle)?;
+                let terminals = if self.automatic_idle_cleanup {
+                    surface
+                        .core
+                        .tick_interactive(now, self.panel, interaction_idle)?
+                } else {
+                    surface.core.tick_without_idle_cleanup(now, self.panel)?
+                };
                 self.cleanup_pending_without_surface = surface.core.cleanup_pending();
                 self.refresh_debt_without_surface = surface.core.refresh_debt();
                 terminals
@@ -831,18 +1001,11 @@ impl<'a> Session<'a> {
     }
 
     fn local_cleanup(&mut self, now: Duration) -> Result<Vec<Envelope>, SessionError> {
-        let Some(surface) = self.surface.as_mut() else {
+        if self.surface.is_none() {
             self.present_fallback(true)?;
             return Ok(Vec::new());
-        };
-        let report = surface.core.request_cleanup(now, self.panel)?;
-        self.cleanup_pending_without_surface = report.cleanup_pending;
-        self.refresh_debt_without_surface = surface.core.refresh_debt();
-        Ok(report
-            .terminals
-            .into_iter()
-            .map(|terminal| self.terminal_result(terminal))
-            .collect())
+        }
+        Ok(self.request_cleanup(now)?.1)
     }
 
     fn validate_envelope_header(&mut self, envelope: &Envelope) -> Result<(), SessionError> {
@@ -1021,6 +1184,7 @@ impl<'a> Session<'a> {
             pen_point: None,
             last_pen: None,
             pen_needs_down: true,
+            ink_paused: false,
             core,
         });
         let ready = SurfaceReady {
@@ -1370,23 +1534,7 @@ impl<'a> Session<'a> {
                 )])
             }
             Some(EpaperRefreshOperation::Cleanup) if !has_parameters => {
-                let report = if let Some(surface) = self.surface.as_mut() {
-                    surface.core.request_cleanup(now, self.panel)?
-                } else {
-                    self.cleanup_pending_without_surface = true;
-                    rm_display_core::CleanupReport {
-                        cleanup_performed: false,
-                        cleanup_pending: true,
-                        backend_failed: false,
-                        terminals: Vec::new(),
-                    }
-                };
-                self.cleanup_pending_without_surface = report.cleanup_pending;
-                let mut responses = report
-                    .terminals
-                    .into_iter()
-                    .map(|terminal| self.terminal_result(terminal))
-                    .collect::<Vec<_>>();
+                let (report, mut responses) = self.request_cleanup(now)?;
                 let active = self.current_refresh_state();
                 let result = if report.backend_failed {
                     EpaperRefreshResultCode::Failed
@@ -1422,7 +1570,8 @@ impl<'a> Session<'a> {
         }
     }
 
-    fn current_refresh_state(&self) -> EpaperRefreshState {
+    /// Active refresh settings and successful physical partial-update count.
+    pub fn current_refresh_state(&self) -> EpaperRefreshState {
         let (config, presented_since_full_refresh, cleanup_pending, fast_updates_since_settled) =
             self.surface.as_ref().map_or(
                 (

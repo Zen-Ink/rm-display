@@ -330,6 +330,18 @@ impl LocalOverlay {
         self.transparent
     }
 
+    /// Continuous row-major, MSB-first coverage mask; no row padding.
+    /// One means covered, zero means transparent. Unused tail bits are zero.
+    pub fn coverage_bitmap(&self) -> Vec<u8> {
+        let mut bitmap = vec![0; self.alpha.len().div_ceil(8)];
+        for (index, alpha) in self.alpha.iter().enumerate() {
+            if *alpha != 0 {
+                bitmap[index / 8] |= 0x80 >> (index % 8);
+            }
+        }
+        bitmap
+    }
+
     pub fn clear(&mut self) {
         self.alpha.fill(0);
         self.transparent = true;

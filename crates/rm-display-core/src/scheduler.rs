@@ -249,6 +249,21 @@ impl DisplayCore {
         self.fast_updates_since_settled
     }
 
+    /// Time of the last successful physical partial update.
+    pub fn last_partial_at(&self) -> Option<Duration> {
+        self.last_partial_at
+    }
+
+    /// Advance frame deadlines without requesting automatic idle cleanup.
+    /// Explicit cleanup and configured frame refresh policy still apply.
+    pub fn tick_without_idle_cleanup(
+        &mut self,
+        now: Duration,
+        panel: &mut dyn PanelBackend,
+    ) -> Result<Vec<TerminalFrame>, CoreError> {
+        self.tick_inner(now, panel, false)
+    }
+
     pub fn refresh_debt(&self) -> RefreshDebt {
         self.refresh_policy.debt()
     }
@@ -312,6 +327,10 @@ impl DisplayCore {
     pub fn peer_overlay_mut(&mut self) -> &mut LocalOverlay {
         &mut self.peer_overlay
     }
+    pub fn ink(&self) -> &LocalOverlay {
+        &self.ink
+    }
+
     pub fn ink_mut(&mut self) -> &mut LocalOverlay {
         &mut self.ink
     }
