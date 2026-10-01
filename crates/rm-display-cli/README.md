@@ -114,3 +114,27 @@ composition, native framebuffer conversion, and backend submission. The byte
 count is the RMD2 framed plaintext size; TLS record overhead is not included.
 Quill submission return is not a measurement of physical ink settling, which
 remains explicitly unavailable.
+
+## Selecting inputs from Rust
+
+`ProducerClient::open_surface_with_input_capabilities` requests exactly the
+input types supplied by the application. For a bridge that forwards touch but
+keeps pen drawing local:
+
+```rust,ignore
+use rm_display_protocol::{InputCapability, SourceKind};
+
+let surface = client.open_surface_with_input_capabilities(
+    0, 0, SourceKind::Browser, &[InputCapability::Touch], "bridge",
+)?;
+```
+
+Pass `&[]` for display-only, or a slice containing any combination of `Touch`,
+`Pen`, `Mouse`, `Key`, and `Text`. The receiver determines the supported subset
+using normal feature/surface negotiation. A nonempty input request retains the
+existing navigation-action request behavior; JSONL delivery requires
+`set_event_output`. Receiver-local drawing is controlled separately by the
+receiver API or the negotiated `OverlayUpdate.local_ink` command.
+
+The existing `open_surface(..., accept_input, ...)` remains compatible: `true`
+requests all five input types and navigation actions; `false` requests neither.

@@ -424,6 +424,7 @@ impl ProducerClient {
         }
     }
 
+    /// Legacy convenience: request every input type when `accept_input` is true.
     pub fn open_surface(
         &mut self,
         desired_width: u32,
@@ -432,17 +433,38 @@ impl ProducerClient {
         accept_input: bool,
         label: &str,
     ) -> Result<Surface, ProducerError> {
-        let input_capabilities = if accept_input {
-            vec![
-                InputCapability::Touch as i32,
-                InputCapability::Pen as i32,
-                InputCapability::Mouse as i32,
-                InputCapability::Key as i32,
-                InputCapability::Text as i32,
-            ]
-        } else {
-            Vec::new()
-        };
+        self.open_surface_with_input_capabilities(
+            desired_width,
+            desired_height,
+            source_kind,
+            if accept_input {
+                &[
+                    InputCapability::Touch,
+                    InputCapability::Pen,
+                    InputCapability::Mouse,
+                    InputCapability::Key,
+                    InputCapability::Text,
+                ]
+            } else {
+                &[]
+            },
+            label,
+        )
+    }
+
+    /// Request exactly these remote input types; an empty slice is display-only.
+    /// The receiver enables supported types through its existing negotiation.
+    /// Like `open_surface`, a nonempty input request also requests navigation
+    /// actions; event handling still requires `set_event_output`.
+    pub fn open_surface_with_input_capabilities(
+        &mut self,
+        desired_width: u32,
+        desired_height: u32,
+        source_kind: SourceKind,
+        input_capabilities: &[InputCapability],
+        label: &str,
+    ) -> Result<Surface, ProducerError> {
+        let accept_input = !input_capabilities.is_empty();
         let action_capabilities = if accept_input {
             vec![
                 ActionId::Back as i32,
@@ -464,7 +486,10 @@ impl ProducerClient {
             pixel_format: PixelFormat::Gray8 as i32,
             orientation: Orientation::Current as i32,
             source_kind: source_kind as i32,
-            input_capabilities,
+            input_capabilities: input_capabilities
+                .iter()
+                .map(|capability| *capability as i32)
+                .collect(),
             action_capabilities,
             label: label.to_owned(),
         }))?;
@@ -1435,6 +1460,75 @@ mod tests {
                 .unwrap();
         }
         bytes.to_vec()
+    }
+
+    #[test]
+    fn surface_input_subscriptions_are_exact_and_legacy_flags_still_work() {
+        for (capabilities, legacy) in [
+            (vec![], Some(false)),
+            (vec![InputCapability::Touch], None),
+            (
+                vec![
+                    InputCapability::Pen,
+                    InputCapability::Key,
+                    InputCapability::Text,
+                ],
+                None,
+            ),
+            (
+                vec![
+                    InputCapability::Touch,
+                    InputCapability::Pen,
+                    InputCapability::Mouse,
+                    InputCapability::Key,
+                    InputCapability::Text,
+                ],
+                Some(true),
+            ),
+        ] {
+            let responses = framed_responses(vec![
+                envelope::Body::ServerHello(server_hello()),
+                envelope::Body::SurfaceReady(ready()),
+            ]);
+            let output = Arc::new(Mutex::new(Vec::new()));
+            let mut client = ProducerClient::new(
+                Box::new(MockIo {
+                    input: Cursor::new(responses),
+                    output: output.clone(),
+                }),
+                [1; 16],
+            );
+            client.hello("test").unwrap();
+            let surface = if let Some(accept_input) = legacy {
+                client.open_surface(0, 0, SourceKind::Browser, accept_input, "subscriptions")
+            } else {
+                client.open_surface_with_input_capabilities(
+                    0,
+                    0,
+                    SourceKind::Browser,
+                    &capabilities,
+                    "subscriptions",
+                )
+            }
+            .unwrap();
+            assert_eq!(surface.generation, 9);
+            let codec = WireCodec::new(1024 * 1024);
+            let mut bytes = BytesMut::from(output.lock().unwrap().as_slice());
+            codec.decode(&mut bytes).unwrap().unwrap(); // ClientHello.
+            let request = codec.decode(&mut bytes).unwrap().unwrap();
+            let Some(envelope::Body::SurfaceOpen(open)) = request.body else {
+                panic!("expected SurfaceOpen")
+            };
+            assert_eq!(
+                open.input_capabilities,
+                capabilities
+                    .iter()
+                    .map(|capability| *capability as i32)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(open.action_capabilities.is_empty(), capabilities.is_empty());
+            assert!(bytes.is_empty());
+        }
     }
 
     #[test]
